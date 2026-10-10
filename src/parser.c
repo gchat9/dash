@@ -37,8 +37,11 @@
 #endif
 
 #include <limits.h>
+#include <pwd.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <wchar.h>
 #include <wctype.h>
 
@@ -1781,6 +1784,49 @@ out:
 }
 
 /*
+ * Expand \u (user name) and \w (working directory) in an already
+ * parameter-expanded prompt.  Done after expandstr() on purpose, so
+ * that a directory name containing '$' or '`' is never re-expanded.
+ */
+static const char *promptesc(const char *s)
+{
+	char *p;
+
+	stalloc(strlen(s) + 1);	/* commit s where it is; build the copy after */
+	STARTSTACKSTR(p);
+	for (; *s; s++) {
+		const char *v = NULL;
+
+		if (*s == '\\' && s[1] == 'u') {
+			struct passwd *pw = getpwuid(geteuid());
+
+			v = pw ? pw->pw_name : "?";
+		} else if (*s == '\\' && s[1] == 'w') {
+			const char *h = lookupvar("HOME");
+			size_t l = h ? strlen(h) : 0;
+
+			v = lookupvar("PWD");
+			if (!v)
+				v = nullstr;
+			/* like bash: fold $HOME into ~, if it is a prefix
+			 * ending at a path boundary (and not just "/") */
+			if (l > 1 && !strncmp(v, h, l) &&
+			    (!v[l] || v[l] == '/')) {
+				STPUTC('~', p);
+				v += l;
+			}
+		}
+		if (v) {
+			s++;
+			p = stputs(v, p);
+		} else
+			STPUTC(*s, p);
+	}
+	STPUTC('\0', p);
+	return stackblock();
+}
+
+/*
  * called by editline -- any expansions to the prompt
  *    should be added here.
  */
@@ -1797,8 +1843,7 @@ getprompt(void *unused)
 	case 0:
 		return nullstr;
 	case 1:
-		prompt = ps1val();
-		break;
+		return promptesc(expandstr(ps1val()));
 	case 2:
 		prompt = ps2val();
 		break;

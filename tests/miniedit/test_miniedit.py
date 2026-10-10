@@ -652,6 +652,74 @@ def test_tab_list_redraws_a_wrapped_line():
 
 
 # ---------------------------------------------------------------- #
+# Prompt escapes
+# ---------------------------------------------------------------- #
+
+def test_prompt_user_and_cwd():
+    import getpass
+    with Session(ps1=r"\u:\w> ") as s:
+        want = "%s:%s> " % (getpass.getuser(), os.getcwd())
+        assert s.screen()[0][0] == want, s.screen()[0]
+        # typing must start right after the expanded prompt
+        s.send("a")
+        assert s.screen()[0][0] == want + "a", s.screen()[0]
+
+
+def _prompt_w(home, cwd):
+    """What \\w shows for the given $HOME and working directory."""
+    old = os.getcwd()
+    os.chdir(cwd)
+    try:
+        with Session(home=home, ps1=r"\w> ") as s:
+            row = s.screen()[0][0]
+    finally:
+        os.chdir(old)
+    assert row.endswith("> "), row
+    return row[:-2]
+
+
+def test_prompt_w_folds_home_into_tilde():
+    import shutil
+    import tempfile
+    base = os.path.realpath(tempfile.mkdtemp(prefix="miniedit-test-"))
+    try:
+        for d in ("h/x", "hx"):
+            os.makedirs(os.path.join(base, d))
+        h = os.path.join(base, "h")
+        assert _prompt_w(h, h) == "~"
+        assert _prompt_w(h, h + "/x") == "~/x"
+        assert _prompt_w(base, h) == "~/h"
+        # all of the following are NOT folded, exactly as in bash:
+        # a prefix that does not end at a path boundary...
+        assert _prompt_w(h, base + "/hx") == base + "/hx"
+        # ...a $HOME that is not a prefix at all...
+        assert _prompt_w(h + "/x", h) == h
+        # ...a $HOME with a trailing slash, an empty one, or just "/"
+        assert _prompt_w(h + "/", h + "/x") == h + "/x"
+        assert _prompt_w("", h) == h
+        assert _prompt_w("/", h) == h
+        assert _prompt_w("/", "/") == "/"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_prompt_cwd_not_reexpanded():
+    import shutil
+    import tempfile
+    base = tempfile.mkdtemp(prefix="miniedit-test-")
+    odd = os.path.join(base, "we$ird`dir")
+    os.mkdir(odd)
+    old = os.getcwd()
+    try:
+        os.chdir(odd)
+        with Session(ps1=r"\w> ") as s:
+            assert s.screen()[0][0] == odd + "> ", s.screen()[0]
+    finally:
+        os.chdir(old)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- #
 # Runner
 # ---------------------------------------------------------------- #
 

@@ -2436,6 +2436,14 @@ The primary prompt string, which defaults to
 .Dq $\  ,
 unless you are the superuser, in which case it defaults to
 .Dq #\  .
+After the usual expansions,
+.Dq \eu
+in it becomes the name of the current user, and
+.Dq \ew
+the current directory, with the leading part that is the
+.Ev HOME
+directory shown as
+.Dq ~ .
 .It Ev PS2
 The secondary prompt string, which defaults to
 .Dq >\  .
