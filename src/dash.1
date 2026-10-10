@@ -842,6 +842,11 @@ was described above.
 The order of word expansion is:
 .Bl -enum
 .It
+Brace Expansion, which generates several words from one
+(command arguments and
+.Ic for
+word lists only).
+.It
 Tilde Expansion, Parameter Expansion, Command Substitution,
 Arithmetic Expansion (these all occur at the same time).
 .It
@@ -859,6 +864,59 @@ Quote Removal.
 .Pp
 The $ character is used to introduce parameter expansion, command
 substitution, or arithmetic evaluation.
+.Ss Brace Expansion
+A word containing an unquoted list of comma separated strings in braces,
+or a sequence expression in braces, is replaced by one word for each
+item, with whatever surrounds the braces repeated around each.
+For example,
+.Dl echo foo-{{1..3},bar}
+prints
+.Dq foo-1 foo-2 foo-3 foo-bar .
+Items may themselves contain braces, and several lists in a word
+combine, the leftmost varying slowest:
+.Dq {a,b}{1,2}
+becomes
+.Dq a1 a2 b1 b2 .
+.Pp
+A sequence expression has the form
+.Ar x Ns Li .. Ns Ar y
+or
+.Ar x Ns Li .. Ns Ar y Ns Li .. Ns Ar step ,
+where
+.Ar x
+and
+.Ar y
+are either both integers or both single letters.
+The words run from
+.Ar x
+to
+.Ar y
+in steps of
+.Ar step
+(default 1; its sign is ignored), counting down if
+.Ar y
+is less than
+.Ar x .
+If either integer has a leading zero, all of the numbers are zero padded
+to the same width.
+.Pp
+Braces are left as they are if they are quoted or backslash escaped,
+contain neither a comma nor a valid sequence expression, lack a closing
+brace, or are part of a
+.Li ${...}
+or
+.Li $((...))
+expansion.
+Brace expansion happens before all other expansions, so the results
+of those, such as the value of a variable, are never brace expanded, and
+.Dq {1..$n}
+does not generate a sequence.
+Each generated word is expanded as if it had been written out in full, so a
+command substitution in or around the braces is run once per word.
+.Pp
+Brace expansion is not performed on assignments, redirection targets,
+.Ic case
+words and patterns, or here-documents.
 .Ss Tilde Expansion (substituting a user's home directory)
 A word beginning with an unquoted tilde character (~) is
 subjected to tilde expansion.

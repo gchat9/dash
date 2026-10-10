@@ -33,6 +33,7 @@
  */
 
 #include <ctype.h>
+#include <errno.h>
 #include <dirent.h>
 #ifdef HAVE_FNMATCH
 #include <fnmatch.h>
@@ -129,6 +130,7 @@ static wchar_t *wcifs;
 static char *argstr(char *p, int flag);
 static char *exptilde(char *startp, int flag);
 static char *expari(char *start, int flag);
+static void expandword(char *, struct nodelist *, struct arglist *, int);
 STATIC void expbackq(union node *, int);
 STATIC char *evalvar(char *, int);
 static size_t strtodest(const char *p, int flags);
@@ -215,21 +217,326 @@ static inline const char *getpwhome(const char *name)
 
 
 /*
+ * Brace expansion.
+ *
+ * This is done on the unexpanded text of a word, ahead of all other
+ * expansions (as in bash), so only braces typed literally and unquoted
+ * are ever considered: the contents of variables and command
+ * substitutions are left alone, and so is anything inside ${...} or
+ * $((...)).  Each generated word is then expanded exactly as if it had
+ * been typed out in full.
+ *
+ * Command substitutions are the one thing that cannot just be copied
+ * around: the word refers to them by position in narg.backquote, and a
+ * generated word may use only some of them, or one of them many times.
+ * So while expanding, every CTLBACKQ is followed by a tag byte naming
+ * its entry in the original list, and a fresh list is built for each
+ * generated word.
+ */
+
+struct brace {
+	struct nodelist *bq;	/* original backquote list, if any */
+	struct arglist *arglist;
+	int flag;
+};
+
+struct bseq {
+	long long a, b;		/* first and last value */
+	unsigned long long step;
+	int width;		/* zero padding, 0 for none */
+	int alpha;		/* {a..e}, not {1..5} */
+};
+
+#define balpha(c)	((unsigned)(((c) | 0x20) - 'a') < 26)
+
+/* Length of the element at p: a CTLMBCHAR span, or one or two bytes. */
+static size_t belem(const char *p)
+{
+	unsigned mb;
+
+	switch ((signed char)*p) {
+	case CTLESC:
+	case CTLBACKQ:		/* followed by its tag */
+		return 2;
+	case CTLMBCHAR:
+		mb = mbnext(p);
+		return (mb & 0xff) + (mb >> 8);
+	}
+	return 1;
+}
+
+/*
+ * Find the first byte of set that is literal text: not escaped, not
+ * quoted and not inside a ${...} or $((...)).  Points to the NUL if none.
+ */
+static char *bfind(char *p, const char *set)
+{
+	int nest = 0, quoted = 0;
+
+	for (; *p; p += belem(p)) {
+		switch ((signed char)*p) {
+		case CTLVAR:
+			if ((*++p & VSTYPE) != VSNORMAL)
+				nest++;
+			continue;
+		case CTLARI:
+			nest++;
+			continue;
+		case CTLENDVAR:
+		case CTLENDARI:
+			nest--;
+			continue;
+		case CTLQUOTEMARK:
+			quoted ^= !nest;
+			continue;
+		}
+		if (!nest && !quoted && strchr(set, *p))
+			break;
+	}
+	return p;
+}
+
+/* End of the comma separated item at p: the next top level , or }. */
+static char *bend(char *p)
+{
+	int depth = 0;
+
+	for (;; p++) {
+		p = bfind(p, "{},");
+		switch (*p) {
+		case '{':
+			depth++;
+			break;
+		case '}':
+			if (!depth--)
+				return p;
+			break;
+		case ',':
+			if (!depth)
+				return p;
+			break;
+		default:
+			return p;
+		}
+	}
+}
+
+static char *bnum(char *p, long long *v)
+{
+	char *e;
+
+	if (!is_digit(*p) && !((*p == '-' || *p == '+') && is_digit(p[1])))
+		return NULL;
+	errno = 0;
+	*v = strtoll(p, &e, 10);
+	return errno ? NULL : e;
+}
+
+/* Does the number in [b, e) have leading zeros, as in 007 or -07? */
+static int blead0(const char *b, const char *e)
+{
+	return (*b == '0' && e - b > 1) || (*b == '-' && b[1] == '0' && e - b > 2);
+}
+
+/* Parse the inside of {x..y} or {x..y..step}, [p, end), as bash does. */
+static int bseq(char *p, char *end, struct bseq *s)
+{
+	long long step = 1;
+	char *b0 = p, *e0, *b1, *e1;
+
+	s->width = 0;
+	s->alpha = balpha(p[0]);
+	if (s->alpha) {
+		if (p[1] != '.' || p[2] != '.' || !balpha(p[3]))
+			return 0;
+		s->a = p[0];
+		s->b = p[3];
+		p += 4;
+	} else {
+		if (!(e0 = bnum(b0, &s->a)) || e0[0] != '.' || e0[1] != '.')
+			return 0;
+		b1 = e0 + 2;
+		if (!(e1 = bnum(b1, &s->b)))
+			return 0;
+		if (blead0(b0, e0) || blead0(b1, e1))
+			s->width = e0 - b0 > e1 - b1 ? e0 - b0 : e1 - b1;
+		p = e1;
+	}
+	if (p != end && (p[0] != '.' || p[1] != '.' ||
+			 !(p = bnum(p + 2, &step))))
+		return 0;
+	if (p != end)
+		return 0;
+	s->step = step < 0 ? 0ULL - (unsigned long long)step : step;
+	if (!s->step)
+		s->step = 1;
+	return 1;
+}
+
+/* s up to open, then n bytes at a, then tail: a new stack string. */
+static char *bjoin(const char *s, const char *open, const char *a, size_t n,
+		   const char *tail)
+{
+	size_t pre = open - s;
+	char *t = stalloc(pre + n + strlen(tail) + 1);
+
+	memcpy(t, s, pre);
+	memcpy(t + pre, a, n);
+	strcpy(t + pre + n, tail);
+	return t;
+}
+
+/* Done with brace expansion: expand t like any other word. */
+static void bemit(char *t, struct brace *c)
+{
+	struct nodelist *bq = NULL, **bqp = &bq;
+	char *p, *q;
+
+	if (c->bq) {
+		/* drop the tags, rebuilding the backquote list from them */
+		for (p = q = t; *p;) {
+			size_t n = belem(p);
+
+			if (*p == CTLBACKQ) {
+				struct nodelist *o = c->bq, *nl;
+				int i = (unsigned char)p[1];
+
+				while (--i)
+					o = o->next;
+				nl = stalloc(sizeof(*nl));
+				nl->n = o->n;
+				nl->next = NULL;
+				*bqp = nl;
+				bqp = &nl->next;
+				*q++ = *p;
+				p += 2;
+				continue;
+			}
+			while (n--)
+				*q++ = *p++;
+		}
+		*q = '\0';
+	}
+	expandword(t, bq, c->arglist, c->flag);
+}
+
+/* Expand the first brace group of s, and the rest of s, recursively. */
+static void bexp(char *s, struct brace *c)
+{
+	struct bseq sq;
+	char *open, *a, *b, *close;
+	int ncomma;
+
+	for (open = bfind(s, "{"); *open; open = bfind(open + 1, "{")) {
+		ncomma = 0;
+		for (close = bend(open + 1); *close == ','; close = bend(close + 1))
+			ncomma++;
+		if (*close && (ncomma || bseq(open + 1, close, &sq)))
+			break;
+	}
+	if (!*open) {
+		bemit(s, c);
+		return;
+	}
+
+	if (ncomma) {
+		for (a = open + 1;; a = b + 1) {
+			b = bend(a);
+			bexp(bjoin(s, open, a, b - a, close + 1), c);
+			if (b == close)
+				break;
+		}
+		return;
+	}
+
+	{
+		char *buf = stalloc(sq.width + 24);
+		long long v = sq.a;
+		unsigned long long d;
+		int up = sq.a <= sq.b;
+
+		for (;;) {
+			if (sq.alpha) {
+				buf[0] = v;
+				buf[1] = '\0';
+			} else
+				snprintf(buf, sq.width + 24, "%0*lld", sq.width, v);
+			bexp(bjoin(s, open, buf, strlen(buf), close + 1), c);
+
+			d = up ? (unsigned long long)sq.b - v :
+				 (unsigned long long)v - sq.b;
+			if (d < sq.step)
+				break;
+			v = up ? (unsigned long long)v + sq.step :
+				 (unsigned long long)v - sq.step;
+		}
+	}
+}
+
+/*
+ * Brace expand a word, if it has anything to expand.  Returns 0 if not,
+ * in which case nothing has been done.
+ */
+static int expbrace(union node *arg, struct arglist *arglist, int flag)
+{
+	struct brace c;
+	struct nodelist *n;
+	char *text = arg->narg.text;
+	char *p, *q;
+	int nbq = 0;
+
+	for (n = arg->narg.backquote; n; n = n->next)
+		nbq++;
+	if (nbq > 255)
+		return 0;
+
+	if (nbq) {
+		size_t len;
+		int k = 0;
+
+		q = stalloc(strlen(text) + nbq + 1);
+		for (p = text, text = q; *p; p += len) {
+			len = *p == CTLBACKQ ? 1 : belem(p);
+			memcpy(q, p, len);
+			q += len;
+			if (*p == CTLBACKQ)
+				*q++ = ++k;
+		}
+		*q = '\0';
+	}
+
+	c.bq = arg->narg.backquote;
+	c.arglist = arglist;
+	c.flag = flag;
+	bexp(text, &c);
+	return 1;
+}
+
+/*
  * Perform variable substitution and command substitution on an argument,
  * placing the resulting list of arguments in arglist.  If EXP_FULL is true,
- * perform splitting and file name expansion.  When arglist is NULL, perform
- * here document expansion.
+ * perform brace expansion, splitting and file name expansion.  When arglist
+ * is NULL, perform here document expansion.
  */
 
 void
 expandarg(union node *arg, struct arglist *arglist, int flag)
 {
+	if ((flag & EXP_FULL) && arglist && strchr(arg->narg.text, '{') &&
+	    expbrace(arg, arglist, flag))
+		return;
+	expandword(arg->narg.text, arg->narg.backquote, arglist, flag);
+}
+
+static void
+expandword(char *text, struct nodelist *bq, struct arglist *arglist, int flag)
+{
 	struct strlist *sp;
 	char *p;
 
-	argbackq = arg->narg.backquote;
+	argbackq = bq;
 	STARTSTACKSTR(expdest);
-	argstr(arg->narg.text, flag);
+	argstr(text, flag);
 	if (arglist == NULL) {
 		/* here document expanded */
 		goto out;
