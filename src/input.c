@@ -51,6 +51,7 @@
 #include "main.h"
 #include "memalloc.h"
 #include "myhistedit.h"
+#include "miniedit.h"
 #include "options.h"
 #include "output.h"
 #include "parser.h"
@@ -339,6 +340,32 @@ retry:
 		return nr;
 	}
 #endif
+
+#ifndef SMALL
+	if (fd == 0 && !el && iflag && stdin_istty && isatty(2)) {
+#else
+	if (fd == 0 && iflag && stdin_istty && isatty(2)) {
+#endif
+		static const char *me_cp;
+		static int me_len;
+
+		if (me_cp == NULL)
+			me_cp = miniedit_gets(&me_len);
+		if (me_cp == NULL)
+			nr = 0;
+		else {
+			if (nr > me_len)
+				nr = me_len;
+			memcpy(buf, me_cp, nr);
+			if (nr != me_len) {
+				me_len -= nr;
+				me_cp += nr;
+			} else
+				me_cp = NULL;
+		}
+
+		return nr;
+	}
 
 	if (likely(use_tee)) {
 		nr = stdin_tee(buf, nr);
