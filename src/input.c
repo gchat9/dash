@@ -138,8 +138,22 @@ void input_init(void)
 
 	istty = tcgetattr(0, &tios) + 1;
 	stdin_istty = istty;
-	if (istty)
+	if (istty) {
 		st->bufferable = tios.c_lflag & ICANON;
+#ifdef IUTF8
+		/*
+		 * In canonical mode, backspace is handled by the kernel's
+		 * tty line discipline, not by us.  Without IUTF8 it erases
+		 * one byte at a time, which mangles multi-byte UTF-8
+		 * characters on backspace.  Ask the driver to erase whole
+		 * characters instead.  We assume a UTF-8 character set.
+		 */
+		if ((tios.c_lflag & ICANON) && !(tios.c_iflag & IUTF8)) {
+			tios.c_iflag |= IUTF8;
+			tcsetattr(0, TCSANOW, &tios);
+		}
+#endif
+	}
 	else {
 		st->seekable = lseek(0, 0, SEEK_CUR) + 1;
 		st->bufferable = !!st->seekable;
