@@ -724,6 +724,119 @@ def test_prompt_cwd_not_reexpanded():
 # ---------------------------------------------------------------- #
 
 # ---------------------------------------------------------------- #
+# History folding of multi-line compound commands
+# ---------------------------------------------------------------- #
+
+def _history_entries(home):
+    with open(os.path.join(home, ".bash_history")) as f:
+        return f.read().split(chr(10))[:-1]
+
+
+def _type_and_run(s, lines):
+    for ln in lines:
+        s.send(ln)
+        s.send(ENTER)
+    # A trailing command so the folded entry is no longer the last one.
+    s.send("echo done")
+    s.send(ENTER)
+
+
+def test_fold_if_else_into_one_entry():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["if true; then", "echo foo", "else",
+                          "echo bar", "fi"])
+        entries = _history_entries(s.home)
+        assert entries == ["if true; then echo foo; else echo bar; fi",
+                           "echo done"], entries
+
+
+def test_fold_loop_into_one_entry():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["for i in 1 2; do", "  echo $i", "done"])
+        entries = _history_entries(s.home)
+        assert entries[0] == "for i in 1 2; do echo $i; done", entries
+
+
+def test_fold_up_arrow_shows_folded_entry():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["if true; then", "echo foo", "fi"])
+        s.send(UP)
+        s.send(UP)
+        rows, row, col = s.screen()
+        assert any(r.endswith("if true; then echo foo; fi") for r in rows), rows
+
+
+def test_fold_leaves_single_line_alone():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["echo one"])
+        assert _history_entries(s.home) == ["echo one", "echo done"]
+
+
+def test_fold_skips_open_quote():
+    # A quote spanning lines is kept as typed rather than mangled.
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["echo 'a", "b'"])
+        entries = _history_entries(s.home)
+        assert entries[0] == "echo 'a" and entries[1] == "b'", entries
+
+
+def test_fold_skips_comment_and_heredoc():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["if true; then # note", "echo x", "fi"])
+        entries = _history_entries(s.home)
+        assert entries[:3] == ["if true; then # note", "echo x", "fi"], entries
+
+
+def test_fold_nested_if():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["if true; then", "  if false; then", "echo no",
+                          "  else", "echo yes", "  fi", "fi"])
+        entries = _history_entries(s.home)
+        assert entries[0] == "if true; then if false; then echo no; else echo yes; fi; fi", entries
+
+
+def test_fold_function_definition():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["f()", "{", "echo in f", "}"])
+        entries = _history_entries(s.home)
+        assert entries[0] == "f() { echo in f; }", entries
+
+
+def test_fold_entries_run_like_the_original():
+    # A folded entry must mean the same thing as the lines typed.
+    import subprocess
+    dash = os.environ.get("MINIEDIT_DASH",
+                          os.path.join(os.path.dirname(__file__),
+                                       "..", "..", "src", "dash"))
+    script = ("if false; then\necho no\nelse\nfor i in a b; do\n"
+              "echo $i\ndone\nfi\n")
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, script.rstrip("\n").split("\n"))
+        folded = _history_entries(s.home)[0]
+    want = subprocess.run([dash, "-c", script], capture_output=True,
+                          text=True).stdout
+    got = subprocess.run([dash, "-c", folded], capture_output=True,
+                         text=True).stdout
+    assert got == want and want == "a\nb\n", (folded, got, want)
+
+
+def test_fold_not_disturbed_by_parallel_session():
+    # Another dash sharing the same $HOME runs a command while this one
+    # is halfway through an if.  Its entry must come out before (never
+    # inside) the folded compound command.
+    import tempfile
+    home = tempfile.mkdtemp(prefix="miniedit-shared-")
+    with Session(ps1="$ ", home=home) as a:
+        a.send("if true; then"); a.send(ENTER)
+        a.send("echo foo"); a.send(ENTER)
+        with Session(ps1="$ ", home=home) as b:
+            b.send("echo other"); b.send(ENTER)
+        a.send("fi"); a.send(ENTER)
+        entries = _history_entries(home)
+        assert entries == ["echo other", "if true; then echo foo; fi"], entries
+
+
+# ---------------------------------------------------------------- #
 # A terminal that does not answer the cursor query (e.g. mc's subshell)
 # ---------------------------------------------------------------- #
 

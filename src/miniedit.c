@@ -307,7 +307,57 @@ static int hist_path(char *buf, int n)
 	return snprintf(buf, n, "%s/.bash_history", home) < n;
 }
 
+/*
+ * History folding.  A compound command typed over several lines
+ * (if/then/else/fi, loops, and so on) is stored as one history entry
+ * instead of one entry per line, as bash does by default:
+ *
+ *	if true; then
+ *	echo foo
+ *	else
+ *	echo bar
+ *	fi
+ *
+ * becomes the single entry
+ *
+ *	if true; then echo foo; else echo bar; fi
+ *
+ * The physical lines are kept in memory as they are typed (hist_append)
+ * and nothing touches the history file until the parser reports that a
+ * complete command has been read: parsecmd() calls miniedit_cmd_begin()
+ * when a command starts and miniedit_cmd_done() when it is finished.
+ * At that point the command is written in one O_APPEND write, folded if
+ * that is safe, otherwise as typed.  So another session's entries can
+ * never land between the lines of a compound command.
+ */
+
+/* The physical lines of the command being read, exactly as typed. */
+static char *fold_raw;
+static size_t fold_rawlen, fold_rawcap;
+static int fold_lines;
+
 static void hist_append(const char *s, int n)
+{
+	if (fold_rawlen + n > fold_rawcap) {
+		size_t cap = fold_rawcap ? fold_rawcap : 1024;
+		char *p;
+
+		while (cap < fold_rawlen + n)
+			cap *= 2;
+		p = realloc(fold_raw, cap);
+		if (!p)
+			return;		/* out of memory: drop the line */
+		fold_raw = p;
+		fold_rawcap = cap;
+	}
+	memcpy(fold_raw + fold_rawlen, s, n);
+	fold_rawlen += n;
+	fold_lines++;
+}
+
+/* Append s[0..n) to the history file in a single write.  O_APPEND
+ * makes the write land at the current end of file as one block. */
+static void hist_write(const char *s, int n)
 {
 	char path[256];
 	int fd;
@@ -317,8 +367,173 @@ static void hist_append(const char *s, int n)
 	fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
 	if (fd < 0)
 		return;
-	write(fd, s, n);
+	while (n > 0) {
+		int w = write(fd, s, n);
+
+		if (w <= 0)
+			break;
+		s += w;
+		n -= w;
+	}
 	close(fd);
+}
+
+/* True if the text o[0..olen) is a command whose newline may be
+ * replaced by a plain space, because the command is still open. */
+static const char *const fold_open_kw[] = {
+	"then", "else", "elif", "if", "do", "while", "until", "!", "{", NULL
+};
+
+static int fold_is_open_kw(const char *w, int wl)
+{
+	int i;
+
+	for (i = 0; fold_open_kw[i]; i++)
+		if (strlen(fold_open_kw[i]) == (size_t)wl &&
+		    !memcmp(fold_open_kw[i], w, wl))
+			return 1;
+	return 0;
+}
+
+/* Decide what a newline after o[0..olen) turns into: nonzero means
+ * "; " (the command ends here), zero means " " (it goes on). */
+static int fold_needs_semi(const char *o, int olen)
+{
+	int e = olen, s, ps, pe, ps2, cmdpos;
+
+	if (!olen)
+		return 0;
+	switch (o[olen - 1]) {
+	case ';': case '&': case '|': case '(':
+		return 0;
+	case ')':
+		/* "name()" heads a function definition, whose body may
+		 * follow on the next line: "f() {" is fine, "f(); {" is
+		 * not.  An empty "$()" is not a function head. */
+		if (olen >= 2 && o[olen - 2] == '(' &&
+		    !(olen >= 3 && o[olen - 3] == '$'))
+			return 0;
+		break;
+	}
+	/* last word is o[s..e) */
+	for (s = e; s > 0 && o[s - 1] != ' '; s--)
+		;
+	/* text before it, with trailing blanks dropped, is o[0..ps) */
+	for (ps = s; ps > 0 && o[ps - 1] == ' '; ps--)
+		;
+	if (ps == 0)
+		cmdpos = 1;
+	else if (strchr(";&|(", o[ps - 1]))
+		cmdpos = 1;
+	else {
+		/* previous word o[ps2..pe) */
+		pe = ps;
+		for (ps2 = pe; ps2 > 0 && o[ps2 - 1] != ' '; ps2--)
+			;
+		/* a function head "f()" is followed by its body */
+		cmdpos = fold_is_open_kw(o + ps2, pe - ps2) ||
+			 (pe > ps2 && o[pe - 1] == ')');
+	}
+	if (cmdpos && fold_is_open_kw(o + s, e - s))
+		return 0;
+	return 1;
+}
+
+/* Can this single line take part in folding?  Rejects anything whose
+ * meaning depends on where the line ends. */
+static int fold_line_ok(const char *s, int n)
+{
+	int i, q = 0, depth = 0;
+
+	for (i = 0; i < n; i++) {
+		char c = s[i];
+
+		if (c == '`')
+			return 0;
+		if (c == '\\' && q != '\'') {
+			if (i + 1 >= n)
+				return 0;	/* line continuation */
+			i++;
+			continue;
+		}
+		if (q) {
+			if (c == q)
+				q = 0;
+			continue;
+		}
+		if (c == '\'' || c == '"') {
+			q = c;
+			continue;
+		}
+		if (c == '#' || (c == '<' && i + 1 < n && s[i + 1] == '<'))
+			return 0;	/* comment, or heredoc */
+		if (c == '(')
+			depth++;
+		else if (c == ')' && --depth < 0)
+			return 0;
+	}
+	if (q || depth)
+		return 0;
+	return 1;
+}
+
+/* Fold the raw lines in in[0..n) into out[], which must hold at least
+ * 2*n+2 bytes.  Returns the length (the result is '\n'-terminated), 0 if
+ * there is nothing to write, or -1 if the command should be left as typed. */
+static int fold_text(const char *in, int n, char *out)
+{
+	int olen = 0, i = 0;
+
+	if (memmem(in, n, "case", 4) || memmem(in, n, "function", 8))
+		return -1;
+	while (i < n) {
+		int ls = i, le, a, b;
+
+		for (le = ls; le < n && in[le] != '\n'; le++)
+			;
+		i = le + 1;
+		for (a = ls; a < le && (in[a] == ' ' || in[a] == '\t'); a++)
+			;
+		for (b = le; b > a && (in[b - 1] == ' ' || in[b - 1] == '\t'); b--)
+			;
+		if (a == b)
+			continue;
+		/* words are split on blanks only, so leave tabs alone */
+		if (memchr(in + a, '\t', b - a) || !fold_line_ok(in + a, b - a))
+			return -1;
+		if (olen) {
+			if (fold_needs_semi(out, olen))
+				out[olen++] = ';';
+			out[olen++] = ' ';
+		}
+		memcpy(out + olen, in + a, b - a);
+		olen += b - a;
+	}
+	if (!olen)
+		return 0;
+	out[olen++] = '\n';
+	return olen;
+}
+
+void miniedit_cmd_begin(void)
+{
+	fold_rawlen = 0;
+	fold_lines = 0;
+}
+
+void miniedit_cmd_done(int complete)
+{
+	char *out = NULL;
+	int olen = 0;
+
+	if (complete && fold_lines > 1 && (out = malloc(2 * fold_rawlen + 2)))
+		olen = fold_text(fold_raw, fold_rawlen, out);
+	if (olen > 0)
+		hist_write(out, olen);
+	else if (fold_lines)
+		hist_write(fold_raw, fold_rawlen);
+	free(out);
+	miniedit_cmd_begin();
 }
 
 /* mmap the history file read-only.  Returns 0 (leaving *map alone)

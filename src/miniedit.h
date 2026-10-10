@@ -37,4 +37,13 @@
  */
 const char *miniedit_gets(int *lenp);
 
+/*
+ * History folding of multi-line compound commands (see miniedit.c).
+ * miniedit_cmd_begin() is called when the parser starts a command;
+ * miniedit_cmd_done() when it has finished one, with complete set to
+ * 0 if the command was cut short (EOF) and must not be folded.
+ */
+void miniedit_cmd_begin(void);
+void miniedit_cmd_done(int complete);
+
 #endif

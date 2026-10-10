@@ -63,6 +63,7 @@
 #include "show.h"
 #include "builtins.h"
 #include "system.h"
+#include "miniedit.h"
 #ifndef SMALL
 #include "myhistedit.h"
 #endif
@@ -161,6 +162,8 @@ static inline int realeofmark(const char *eofmark)
 union node *
 parsecmd(int interact)
 {
+	union node *n;
+
 	tokpushback = 0;
 	checkkwd = 0;
 	heredoclist = 0;
@@ -168,7 +171,10 @@ parsecmd(int interact)
 	if (doprompt)
 		setprompt(doprompt);
 	needprompt = 0;
-	return list(1);
+	miniedit_cmd_begin();
+	n = list(1);
+	miniedit_cmd_done(n != NEOF);
+	return n;
 }
 
 
