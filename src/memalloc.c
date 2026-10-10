@@ -59,7 +59,7 @@ static void *checknull(void *p)
  * Like malloc, but returns an error when out of space.
  */
 
-__attribute__((__noinline__)) void *ckmalloc(size_t nbytes)
+__attribute__((noinline)) void *ckmalloc(size_t nbytes)
 {
 	void *p;
 
@@ -72,7 +72,7 @@ __attribute__((__noinline__)) void *ckmalloc(size_t nbytes)
  * Same for realloc.
  */
 
-__attribute__((__noinline__)) void *ckrealloc(void *p, size_t nbytes)
+__attribute__((noinline)) void *ckrealloc(void *p, size_t nbytes)
 {
 	p = realloc(p, nbytes);
 	return checknull(p);
@@ -160,7 +160,7 @@ void stunalloc(void *p)
 
 
 
-__attribute__((__noinline__)) void pushstackmark(struct stackmark *mark,
+__attribute__((noinline)) void pushstackmark(struct stackmark *mark,
 						 size_t len)
 {
 	mark->stackp = stackp;
@@ -271,7 +271,7 @@ growstackstr(void)
 	return growstackblock(0) + len;
 }
 
-__attribute__((__noinline__)) char *growstackto(size_t len)
+__attribute__((noinline)) char *growstackto(size_t len)
 {
 	if (stackblocksize() < len)
 		return growstackblock(len);
@@ -282,14 +282,14 @@ __attribute__((__noinline__)) char *growstackto(size_t len)
  * Called from CHECKSTRSPACE.
  */
 
-__attribute__((__noinline__)) char *makestrspace(size_t newlen, char *p)
+__attribute__((noinline)) char *makestrspace(size_t newlen, char *p)
 {
 	size_t len = p - stacknxt;
 
 	return growstackto(len + newlen) + len;
 }
 
-__attribute__((__noinline__)) char *stnputs(const char *s, size_t n, char *p)
+__attribute__((noinline)) char *stnputs(const char *s, size_t n, char *p)
 {
 	p = makestrspace(n, p);
 	p = mempcpy(p, s, n);
