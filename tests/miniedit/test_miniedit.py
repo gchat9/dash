@@ -888,6 +888,59 @@ def test_silent_terminal_does_not_wait_per_prompt():
     assert took < 3, took
 
 
+# ---------------------------------------------------------------- #
+# History filters: HISTCONTROL=ignoreboth-style behaviour
+# ---------------------------------------------------------------- #
+
+def test_hist_skips_command_starting_with_space():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, [" echo secret", "echo shown"])
+        assert _history_entries(s.home) == ["echo shown", "echo done"], \
+            _history_entries(s.home)
+
+
+def test_hist_skips_folded_compound_starting_with_space():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, [" if true; then", "echo foo", "fi"])
+        assert _history_entries(s.home) == ["echo done"], \
+            _history_entries(s.home)
+
+
+def test_hist_skips_exact_duplicate():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["echo a", "echo b", "echo a"])
+        assert _history_entries(s.home) == ["echo a", "echo b", "echo done"], \
+            _history_entries(s.home)
+
+
+def test_hist_duplicate_check_is_whole_file_not_last_entry():
+    # Unlike bash's ignoredups, which only compares with the last
+    # entry, an earlier copy anywhere in the file counts.
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["echo a", "echo b", "echo c", "echo a"])
+        assert _history_entries(s.home) == \
+            ["echo a", "echo b", "echo c", "echo done"], \
+            _history_entries(s.home)
+
+
+def test_hist_duplicate_must_match_whole_line():
+    # Substrings and prefixes of earlier commands are not duplicates.
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["echo a", "echo ab", "echo a b"])
+        assert _history_entries(s.home) == \
+            ["echo a", "echo ab", "echo a b", "echo done"], \
+            _history_entries(s.home)
+
+
+def test_hist_skips_duplicate_folded_compound():
+    with Session(ps1="$ ") as s:
+        _type_and_run(s, ["if true; then", "echo x", "fi"])
+        _type_and_run(s, ["if true; then", "echo x", "fi"])
+        assert _history_entries(s.home) == \
+            ["if true; then echo x; fi", "echo done"], \
+            _history_entries(s.home)
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
