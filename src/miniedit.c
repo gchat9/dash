@@ -107,6 +107,10 @@ static int read1(char *c)
 			npend = ppos = 0;
 		return 1;
 	}
+	/* An interrupt may have arrived while we were not blocked in read()
+	 * (e.g. during the cursor query); report it rather than block. */
+	if (int_pending())
+		return -1;
 	do
 		n = read(0, c, 1);
 	while (n < 0 && errno == EINTR && !int_pending());
