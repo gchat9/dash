@@ -228,5 +228,25 @@ AC_ARG_ENABLE(lineno, AS_HELP_STRING(--disable-lineno, \
 if test "$enable_lineno" != "no"; then
 	AC_DEFINE([WITH_LINENO], 1, [Define if you build with -DWITH_LINENO])
 fi
+
+dnl History filters, as bash's HISTCONTROL=ignoreboth.  On by default.
+AC_ARG_ENABLE(hist-ignorespace, AS_HELP_STRING(--disable-hist-ignorespace, \
+	[Do not drop commands that start with a space from the history]))
+if test "$enable_hist_ignorespace" = "no"; then
+	AC_DEFINE([HIST_IGNORESPACE], [0],
+		  [Define to 1 to drop commands starting with a space from history])
+else
+	AC_DEFINE([HIST_IGNORESPACE], [1],
+		  [Define to 1 to drop commands starting with a space from history])
+fi
+AC_ARG_ENABLE(hist-ignoredups, AS_HELP_STRING(--disable-hist-ignoredups, \
+	[Do not drop commands already present in the history]))
+if test "$enable_hist_ignoredups" = "no"; then
+	AC_DEFINE([HIST_IGNOREDUPS], [0],
+		  [Define to 1 to drop commands already present in history])
+else
+	AC_DEFINE([HIST_IGNOREDUPS], [1],
+		  [Define to 1 to drop commands already present in history])
+fi
 AC_CONFIG_FILES([Makefile src/Makefile])
 AC_OUTPUT

@@ -515,6 +515,67 @@ static int fold_text(const char *in, int n, char *out)
 	return olen;
 }
 
+/*
+ * Keeping commands out of the history, as bash does with
+ * HISTCONTROL=ignoreboth:
+ *
+ *   - a command whose first character is a space is not saved;
+ *   - a command whose text exactly matches a line already in the
+ *     history file is not saved again.
+ *
+ * Both are on by default.  --disable-hist-ignorespace and
+ * --disable-hist-ignoredups (configure) turn them off.  The fallbacks
+ * below only matter when building without configure.
+ */
+#ifndef HIST_IGNORESPACE
+#define HIST_IGNORESPACE 1
+#endif
+#ifndef HIST_IGNOREDUPS
+#define HIST_IGNOREDUPS 1
+#endif
+
+static int hist_open(const char **map, size_t *len);
+
+/* True if the history file already has a line whose text is exactly
+ * e[0..elen), with or without a final '\n'.  Only whole lines count:
+ * a command is never found inside a longer one. */
+static int hist_has(const char *e, int elen)
+{
+	const char *map, *p, *end;
+	size_t maplen;
+	int found = 0;
+
+	if (elen > 0 && e[elen - 1] == '\n')
+		elen--;
+	if (elen <= 0 || !hist_open(&map, &maplen))
+		return 0;
+	end = map + maplen;
+	for (p = map; (p = memmem(p, end - p, e, elen)) != NULL; p++) {
+		if ((p == map || p[-1] == '\n') &&
+		    (p + elen == end || p[elen] == '\n')) {
+			found = 1;
+			break;
+		}
+	}
+	munmap((void *)map, maplen);
+	return found;
+}
+
+/* Should this command be left out of the history?  raw is the command
+ * as typed; entry[0..elen) is the text that would be written for it. */
+static int hist_skip(const char *raw, int rawlen, const char *entry, int elen)
+{
+#if HIST_IGNORESPACE
+	if (rawlen > 0 && raw[0] == ' ')
+		return 1;
+#endif
+#if HIST_IGNOREDUPS
+	if (hist_has(entry, elen))
+		return 1;
+#endif
+	return 0;
+}
+
 void miniedit_cmd_begin(void)
 {
 	fold_rawlen = 0;
@@ -525,13 +586,17 @@ void miniedit_cmd_done(int complete)
 {
 	char *out = NULL;
 	int olen = 0;
+	const char *entry = fold_raw;
+	int elen = fold_rawlen;
 
 	if (complete && fold_lines > 1 && (out = malloc(2 * fold_rawlen + 2)))
 		olen = fold_text(fold_raw, fold_rawlen, out);
-	if (olen > 0)
-		hist_write(out, olen);
-	else if (fold_lines)
-		hist_write(fold_raw, fold_rawlen);
+	if (olen > 0) {
+		entry = out;
+		elen = olen;
+	}
+	if (fold_lines && !hist_skip(fold_raw, fold_rawlen, entry, elen))
+		hist_write(entry, elen);
 	free(out);
 	miniedit_cmd_begin();
 }
