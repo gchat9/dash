@@ -136,6 +136,10 @@ main(int argc, char **argv)
 			goto state2;
 		else if (s == 3)
 			goto state3;
+		else if (s == 5)
+			goto state5;	/* ENV failed: still try ~/.bashrc */
+		else if (s == 6)
+			goto state3;	/* ~/.bashrc failed: go on to the prompt */
 		else
 			goto state4;
 	}
@@ -156,7 +160,7 @@ state1:
 		read_profile("$HOME/.profile");
 	}
 state2:
-	state = 3;
+	state = 5;
 	if (
 #ifndef linux
 		getuid() == geteuid() && getgid() == getegid() &&
@@ -167,6 +171,19 @@ state2:
 			read_profile(shinit);
 		}
 	}
+state5:
+	/* Interactive shells (login or not) also read ~/.bashrc, like bash.
+	 * An error there only skips the rest of that file. */
+	state = 6;
+#ifndef NO_BASHRC
+	if (
+#ifndef linux
+		getuid() == geteuid() && getgid() == getegid() &&
+#endif
+		iflag
+	)
+		read_profile("$HOME/.bashrc");
+#endif
 	popstackmark(&smark);
 state3:
 	state = 4;
