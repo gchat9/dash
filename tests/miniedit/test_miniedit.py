@@ -941,6 +941,239 @@ def test_hist_skips_duplicate_folded_compound():
             _history_entries(s.home)
 
 
+# ---------------------------------------------------------------- #
+# No terminal queries while editing
+#
+# Editing works out where typing starts from the prompt's text, so the
+# only query left is Ctrl+L, which needs the cursor's screen row.  A
+# program that drives the shell by typing into a pty nobody answers
+# (midnight commander's subshell) must not stall or garble the prompt.
+# ---------------------------------------------------------------- #
+
+CURSOR_QUERY = b"\x1b[6n"
+
+
+def test_no_cursor_query_while_editing():
+    with Session(ps1="$ ") as s:
+        for k in ["echo hello", LEFT, LEFT, "x", RIGHT, BACKSPACE,
+                  CTRL_LEFT, CTRL_W, "echo ok", HOME, END, UP, DOWN,
+                  ENTER]:
+            s.send(k)
+        assert CURSOR_QUERY not in s.data, s.data[-200:]
+
+
+def test_no_cursor_query_for_tab_listing():
+    with _tabdir(["alpha", "beta", "gamma"]) as d:
+        with Session(ps1="$ ", cwd=d, home=d) as s:
+            s.send("ls ")
+            s.send("\t")
+            s.send("\t")
+            assert CURSOR_QUERY not in s.data, s.data[-200:]
+            rows, row, col = s.screen()
+            assert rows[-1].startswith("$ ls "), rows
+
+
+def test_ctrl_l_is_the_only_query():
+    # Ctrl+L needs the cursor's row, so it still asks - and only then.
+    with Session(height=10, ps1="$ ") as s:
+        s.send("echo a")
+        assert CURSOR_QUERY not in s.data
+        s.send(CTRL_L)
+        assert CURSOR_QUERY in s.data
+
+
+def test_silent_terminal_typed_ahead_with_cursor_moves():
+    # mc-style: keys arrive before the shell prints anything, and the
+    # terminal never answers.  Editing must still be exact, and fast.
+    keys = b"echo helo\x1b[Dl\n"
+    out, took = _silent_terminal_session(keys, 3, until=b"\r\nhello\r\n")
+    assert b"\r\nhello\r\n" in out, out[-300:]
+    assert CURSOR_QUERY not in out, out[-300:]
+    assert took < 2, took
+
+
+# ---------------------------------------------------------------- #
+# Prompt width, computed from the prompt text
+# ---------------------------------------------------------------- #
+
+def test_prompt_colour_codes_take_no_columns():
+    # SGR codes in the prompt occupy no columns, so typing lands right
+    # after the visible "$ ".
+    with Session(width=20, ps1="\x1b[1;32m$ \x1b[0m") as s:
+        s.send("abc")
+        rows, row, col = s.screen()
+        assert rows[0] == "$ abc", rows
+        assert (row, col) == (0, 5), (row, col)
+
+
+def test_prompt_filling_its_row_starts_edit_on_next_row():
+    # A prompt exactly as wide as the terminal leaves the cursor pending
+    # at the margin; typing must start on the next row, not overwrite
+    # the prompt's last character.
+    prompt = "0123456789" * 2
+    with Session(width=20, ps1=prompt) as s:
+        s.send("a")
+        rows, row, col = s.screen()
+        assert rows[0] == prompt, rows
+        assert rows[1] == "a", rows
+        assert (row, col) == (1, 1), (row, col)
+
+
+def test_prompt_wider_than_terminal_wraps_before_typing():
+    with Session(width=20, ps1="x" * 25) as s:
+        s.send("a")
+        rows, row, col = s.screen()
+        assert rows[0] == "x" * 20, rows
+        assert rows[1] == "x" * 5 + "a", rows
+        assert (row, col) == (1, 6), (row, col)
+
+
+def test_typing_after_output_without_newline():
+    # Like bash: the prompt follows output on the same row, and editing
+    # carries on from wherever the prompt ends.
+    with Session(ps1="$ ") as s:
+        s.send("printf foo\n")
+        s.send("bar")
+        s.send(LEFT)
+        s.send("X")
+        rows, row, col = s.screen()
+        assert "foo$ baXr" in rows, rows
+        s.send(ENTER)
+        assert "baXr: not found" in s.text(), s.text()[-300:]
+
+
+def test_ctrl_r_after_output_without_newline():
+    with Session(ps1="$ ") as s:
+        s.send("echo target\n")
+        s.send("printf foo\n")
+        s.send("ech")
+        s.send(CTRL_R)
+        s.send("targ")
+        rows, row, col = s.screen()
+        assert any("foo$ " in r and "(reverse-i-search)" in r
+                   for r in rows), rows
+
+
+# ---------------------------------------------------------------- #
+# Incremental redraw: the cursor's pending-wrap state at the margin
+#
+# A line that exactly fills its row leaves the cursor in the pending
+# state: the next character wraps, but a cursor movement clears that.
+# Each of these moves out of, or back into, that state.
+# ---------------------------------------------------------------- #
+
+FULL = "abcdefghijklmnopqr"      # "$ " + 18 characters fills a 20-column row
+
+
+def test_backspace_out_of_a_full_row():
+    with Session(width=20, ps1="$ ") as s:
+        s.send(FULL)
+        s.send(BACKSPACE)
+        s.send("Q")
+        rows, row, col = s.screen()
+        rows = rows + [""]
+        assert rows[0] == "$ " + FULL[:17] + "Q", rows
+        assert rows[1] == "", rows
+        assert (row, col) == (0, 20), (row, col)     # pending again
+
+
+def test_home_and_end_over_a_full_row():
+    with Session(width=20, ps1="$ ") as s:
+        s.send(FULL)
+        s.send(HOME)
+        s.send(END)
+        s.send("Z")
+        rows, row, col = s.screen()
+        assert rows[0] == "$ " + FULL, rows
+        assert rows[1] == "Z", rows
+        assert (row, col) == (1, 1), (row, col)
+
+
+def test_insert_before_last_char_of_a_full_row():
+    with Session(width=20, ps1="$ ") as s:
+        s.send(FULL)
+        s.send(LEFT)
+        s.send("Z")
+        rows, row, col = s.screen()
+        assert rows[0] == "$ " + FULL[:17] + "Z", rows
+        assert rows[1] == "r", rows
+        assert (row, col) == (1, 0), (row, col)     # just before the "r"
+
+
+def test_ctrl_l_from_a_full_row_keeps_typing_on_next_row():
+    with Session(width=20, height=8, ps1="$ ") as s:
+        for _ in range(3):
+            s.send("echo a\n")
+        s.send(FULL)
+        s.send(CTRL_L)
+        s.send("Q")
+        rows, row, col = s.screen()
+        assert rows[0] == "$ " + FULL and rows[1] == "Q", rows
+        assert (row, col) == (1, 1), (rows, row, col)
+
+
+
+def test_ctrl_w_to_a_full_row_then_left_and_insert():
+    # Ctrl+W leaves the line exactly filling its row, with the cursor at
+    # the end; a following LEFT must then be exact too.
+    with Session(width=10, ps1="$ ") as s:
+        s.send("abcdefg hij")
+        s.send(CTRL_W)
+        s.send(LEFT)
+        s.send("Q")
+        rows, row, col = s.screen()
+        assert rows[0] == "$ abcdefgQ", rows
+        assert rows[1].strip() == "", rows
+        assert (row, col) == (1, 0), (row, col)
+
+
+def test_left_from_the_end_of_a_full_row_lands_on_the_last_character():
+    with Session(width=20, ps1="$ ") as s:
+        s.send(FULL)
+        s.send(LEFT)
+        rows, row, col = s.screen()
+        assert (row, col) == (0, 19), (row, col)
+
+
+
+# ---------------------------------------------------------------- #
+# Backspace: exactly what it sends
+#
+# These pin the bytes, not just the screen.  A backspace at the end is
+# backspace, space, backspace; one in the middle moves back, rewrites the
+# tail, erases the old end, and moves back to the cursor.  Bash 5.2 sends
+# the same bytes for these cases.
+# ---------------------------------------------------------------- #
+
+def test_backspace_at_end_sends_only_backspace_space_backspace():
+    with Session(ps1="$ ") as s:
+        s.send("abc")
+        n0 = len(s.data)
+        s.send(BACKSPACE)
+        assert s.data[n0:] == b"\x08 \x08", s.data[n0:]
+
+
+def test_backspace_over_the_last_column_of_a_full_row():
+    # The deleted cell is the row's last column, so the simple form does
+    # not apply; the screen must still come out right.
+    with Session(width=10, ps1="$ ") as s:
+        s.send("abcdefgh")
+        s.send(BACKSPACE)
+        rows, row, col = s.screen()
+        assert rows[0] == "$ abcdefg", rows
+        assert (row, col) == (0, 9), (row, col)
+
+
+def test_backspace_mid_line_sends_back_tail_erase_and_return():
+    with Session(ps1="$ ") as s:
+        s.send("abcxy")
+        s.send(LEFT)
+        s.send(LEFT)
+        n0 = len(s.data)
+        s.send(BACKSPACE)
+        assert s.data[n0:] == b"\x08\x1b[Kxy\x08\x08", s.data[n0:]
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

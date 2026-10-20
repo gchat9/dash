@@ -2,11 +2,11 @@
 pty-based harness for driving the dietlibc dash build interactively.
 
 Spawns dash -i on one end of a pty, sends keystrokes, and captures
-everything it writes back - including answering the "\\x1b[6n" cursor
-position query the way a real terminal would (miniedit.c relies on
-that query to find out where the prompt ends; without a real answer
-it silently falls back to column 1, which would hide real bugs in
-anything that depends on the true prompt column).
+everything it writes back.  It answers the "\\x1b[6n" cursor position
+query the way a real terminal would, because Ctrl+L still asks for the
+cursor's row.  Ordinary editing never asks: the tests check that
+(see test_no_cursor_query_while_editing), so a session that does not
+answer would not hide anything else.
 
 Each Session gets its own isolated $HOME (so ~/.bash_history tests
 don't cross-contaminate), and is torn down with SIGKILL + waitpid
@@ -102,8 +102,12 @@ class Session:
             if b"\x1b[6n" in chunk:
                 rows, row, col = simulate(self.data, self.width,
                                            self.height)
+                # col is already self.width when the cursor is pending at
+                # the margin; a real terminal reports that same column,
+                # 1-based, never one past the right edge.
                 os.write(self.master,
-                         "\x1b[{};{}R".format(row + 1, col + 1)
+                         "\x1b[{};{}R".format(row + 1,
+                                               min(col + 1, self.width))
                          .encode())
 
     def screen(self):

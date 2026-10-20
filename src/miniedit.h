@@ -19,6 +19,13 @@
  *
  * It assumes a vt100-compatible terminal (xterm and practically
  * everything else in common use).
+ *
+ * Ordinary editing never asks the terminal anything: no cursor position
+ * report (ESC [ 6 n) is sent while typing, moving the cursor, using
+ * history or completing names.  The only exception is Ctrl+L, which
+ * needs the cursor's screen row.  This matters for programs that drive
+ * the shell by typing into a pty before, or without, a terminal
+ * answering: they must get the line echoed and edited straight away.
  */
 
 #ifndef MINIEDIT_H
@@ -36,6 +43,16 @@
  * an empty line).
  */
 const char *miniedit_gets(int *lenp);
+
+/*
+ * Called by the parser each time it prints a prompt, with the expanded
+ * prompt text.  The editor works out where typing starts from this text
+ * (its visible width), rather than asking the terminal where the cursor
+ * is: a terminal that is not answering, such as a pty a program is
+ * driving, would otherwise stall the shell or garble its prompt.  The
+ * prompt belongs to the next miniedit_gets() call.
+ */
+void miniedit_prompt_shown(const char *s);
 
 /*
  * History folding of multi-line compound commands (see miniedit.c).

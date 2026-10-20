@@ -15,9 +15,11 @@ beyond miniedit's own test suite):
 
   - Only the handful of escape sequences miniedit.c itself emits are
     understood: CUU (\\x1b[<n>A - cursor up), CUD (\\x1b[<n>B - cursor
-    down, stopping at the bottom row), CUP (\\x1b[<row>;<col>H), CHA
+    down, stopping at the bottom row), CUF (\\x1b[<n>C - cursor right),
+    CUB (\\x1b[<n>D - cursor left), CUP (\\x1b[<row>;<col>H), CHA
     (\\x1b[<n>G - cursor to column n), ED (\\x1b[J - erase from cursor
-    to end of screen), plus plain \\r and \\n. Any other
+    to end of screen), EL (\\x1b[K - erase to end of line), plus plain
+    \\r, \\n and BS (\\x08). Any other
     recognized-as-CSI sequence (e.g. dash's own "\\x1b[6n"
     cursor-position query) is consumed and ignored rather than painted
     as literal text, but its *effect* (if any) is not modeled.
@@ -106,6 +108,12 @@ def simulate(data, width, height=1000, scrollback=None):
                 col = min(int(c_s or 1), width) - 1
                 ensure_row(row)
                 pending_wrap = False
+            elif final == b"C":
+                col = min(col + num, width - 1)
+                pending_wrap = False
+            elif final == b"D":
+                col = max(col - num, 0)
+                pending_wrap = False
             elif final == b"G":
                 col = num - 1
                 pending_wrap = False
@@ -114,10 +122,19 @@ def simulate(data, width, height=1000, scrollback=None):
                 rows[row] = rows[row][:col]
                 for r in range(row + 1, len(rows)):
                     rows[r] = ""
+            elif final == b"K":
+                ensure_row(row)
+                # from the cursor (the last column, if it is pending) to the end of the row
+                rows[row] = rows[row][:(width - 1 if pending_wrap else col)]
             # anything else recognized as CSI: consumed, not modeled
             i = m.end()
             continue
         if data[i] == 0x07:  # BEL: audible only
+            i += 1
+            continue
+        if data[i] == 0x08:  # BS: one column left, never past the first
+            col = max(col - 1, 0)
+            pending_wrap = False
             i += 1
             continue
         if data[i] == 0x0D:  # \r

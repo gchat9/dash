@@ -19,9 +19,7 @@
 
 #include "shell.h"
 #include "error.h"
-#include "memalloc.h"
 #include "miniedit.h"
-#include "parser.h"
 #include "var.h"
 
 /* Number of bytes in the UTF-8 character starting with byte c. */
@@ -97,6 +95,8 @@ static int word_right(const char *s, int len, int pos)
 static char pend[32];
 static int npend, ppos;
 
+static void oflush(void);
+
 static int read1(char *c)
 {
 	int n;
@@ -107,6 +107,7 @@ static int read1(char *c)
 			npend = ppos = 0;
 		return 1;
 	}
+	oflush();
 	/* An interrupt may have arrived while we were not blocked in read()
 	 * (e.g. during the cursor query); report it rather than block. */
 	if (int_pending())
@@ -117,9 +118,48 @@ static int read1(char *c)
 	return n;
 }
 
-static void out(const char *s, int n)
+/*
+ * Output is collected here and sent with one write() per keystroke:
+ * oflush() runs before every wait for input, before the cursor query,
+ * and when the line is finished.  A write() per cursor move would be a
+ * separate packet each over ssh.
+ */
+#define OBUF_MAX 256
+static char obuf[OBUF_MAX];
+static int olen;
+
+static void oflush(void)
 {
-	write(2, s, n);
+	int off = 0;
+
+	while (off < olen) {
+		int n = write(2, obuf + off, olen - off);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		off += n;
+	}
+	olen = 0;
+}
+
+static void __attribute__((noinline)) out(const char *s, int n)
+{
+	while (n > 0) {
+		int k = OBUF_MAX - olen;
+
+		if (k > n)
+			k = n;
+		if (k == 0) {
+			oflush();
+			continue;
+		}
+		memcpy(obuf + olen, s, k);
+		olen += k;
+		s += k;
+		n -= k;
+	}
 }
 
 static void outseq(const char *fmt, int n)
@@ -143,17 +183,19 @@ static int get_width(void)
 }
 
 /* Ask the terminal where the cursor is right now (via a Device
- * Status Report) so we know which column editing starts at, without
- * having to work out the display width of the shell's prompt
- * ourselves.  Returns the column, and the row too if rowp is not
+ * Status Report).  Returns the column, and the row too if rowp is not
  * NULL (0 if unknown).
+ *
+ * Editing does not use this: where typing starts is worked out from the
+ * prompt's text (see prompt_start).  Ctrl+L still does, because it has
+ * to know which screen row the edit block is on, and that can only be
+ * asked for.  It is only ever called on that explicit keypress.
  *
  * Only a real reply, ESC [ row ; col R, is taken.  Anything else that
  * arrives in the meantime is typed ahead by the user (or by whoever
- * drives this shell, e.g. a file manager sending its first command) and
- * is put back for the editor to read, not thrown away.  A terminal that
- * never answers costs one short wait, after which we stop asking and
- * fall back to column 1: the display just won't wrap perfectly then. */
+ * drives this shell) and is put back for the editor to read, not thrown
+ * away.  A terminal that never answers costs one short wait, after which
+ * we stop asking. */
 static int dsr_silent;		/* a query went unanswered: stop asking */
 
 static int get_cursor(int *rowp)
@@ -166,6 +208,7 @@ static int get_cursor(int *rowp)
 	if (dsr_silent || npend - ppos > 0)
 		return col;
 	out("\033[6n", 4);
+	oflush();
 	for (;;) {
 		fd_set rfds;
 		struct timeval tv;
@@ -214,6 +257,100 @@ static int get_cursor(int *rowp)
 	return col;
 }
 
+/*
+ * The prompt the parser last printed: it is in front of the line being
+ * read, and its visible width tells us where the edit block begins,
+ * without asking the terminal.  That is what keeps the editor from
+ * ever sending a query.
+ *
+ * Only line wrapping needs the width to be right.  Everything else is
+ * relative to where the cursor physically is (see refresh), so editing
+ * on one row works wherever the prompt happens to start.  When a line
+ * wraps after a prompt that did not start in column 1 (output without
+ * a final newline, say), the wrap points are guessed, so a cursor move
+ * across the first row's boundary can land a column off.  The command
+ * itself is never affected.
+ */
+static char *cur_prompt;
+static int cur_prompt_len, cur_prompt_cols;
+
+/* The cursor, as of the last redraw (see refresh): at_off display
+ * columns after the start of the edit block, and at_pend if it is in
+ * the pending-wrap state. */
+static int at_off, at_pend;
+
+/* The text drawn after the block start, as of the last redraw. */
+#define SHOWN_MAX (MINIEDIT_MAXLINE + 64)	/* bigger than any Ctrl+R display */
+static char shown[SHOWN_MAX];
+static int shown_len;
+
+/* Columns taken by the last line of s.  Escape sequences (SGR colours,
+ * say) take none, a newline starts a new line, a tab goes to the next
+ * multiple of 8, and each UTF-8 character counts as one column, as
+ * utf8_count does for the line itself. */
+static int text_cols(const char *s)
+{
+	int col = 0;
+
+	for (; *s; s++) {
+		unsigned char c = *s;
+
+		if (c == 0x1b) {	/* ESC: a CSI sequence, or a two-byte one */
+			if (s[1] == '[') {
+				s += 2;
+				while (*s && !(*s >= 0x40 && *s <= 0x7e))
+					s++;
+				if (!*s)
+					break;
+			} else if (s[1]) {
+				s++;
+			}
+		} else if (c == '\n' || c == '\r') {
+			col = 0;
+		} else if (c == '\t') {
+			col = (col | 7) + 1;
+		} else if (c >= 0x20 && c != 0x7f && (c & 0xc0) != 0x80) {
+			col++;
+		}
+	}
+	return col;
+}
+
+void miniedit_prompt_shown(const char *s)
+{
+	size_t n = strlen(s);
+	char *p = malloc(n + 1);
+
+	free(cur_prompt);
+	cur_prompt = NULL;
+	cur_prompt_len = cur_prompt_cols = 0;
+	if (!p)
+		return;		/* no memory: editing falls back to column 1 */
+	memcpy(p, s, n + 1);
+	cur_prompt = p;
+	cur_prompt_len = n;
+	cur_prompt_cols = text_cols(s);
+}
+
+/* Set up where typing starts, just after the current prompt, on a
+ * terminal width columns wide: *start_col is the 1-based column and
+ * *row is 0.  A prompt that fills its last row exactly leaves the cursor
+ * in the pending-wrap state (see park_end), so there the edit moves on
+ * to a fresh row first, rather than overwriting the prompt's last
+ * character. */
+static void edit_start(int width, int *start_col, int *row)
+{
+	int c = cur_prompt_cols;
+
+	if (c > 0 && c % width == 0)
+		out("\r\n", 2);
+	*start_col = c % width + 1;
+	*row = 0;
+	at_off = 0;
+	at_pend = 0;
+	shown_len = 0;
+}
+
 /* Insert n bytes at the cursor; 0 if the line has no room for them. */
 static int linsert(char *line, int *len, int *cur, const char *s, int n)
 {
@@ -227,71 +364,180 @@ static int linsert(char *line, int *len, int *cur, const char *s, int n)
 }
 
 /*
- * Redraw the whole line from scratch and reposition the cursor.
- * This is simpler and far more robust than patching up the screen
- * incrementally, especially once a line is long enough to wrap onto
- * further terminal rows: we let the terminal's own line wrap do the
- * work, and only have to reason about how many on-screen rows the
- * text before/up to the cursor occupies.
- *
- * *row tracks which wrapped row the cursor was left on by the
- * previous refresh, so we know how far up to move before redrawing.
+ * Cursor motion within the block: dir is 'A' (up), 'B' (down), 'C'
+ * (right) or 'D' (left), n steps.  A few steps left are backspaces: one
+ * byte each, and they never wrap, since a move never goes past the first
+ * column of its row.
  */
-/*
- * Row the cursor physically rests on right after writing `offset`
- * display columns' worth of characters starting at column 1.
- *
- * When offset lands exactly on a row boundary, a real terminal does
- * NOT advance to the next row until another character is actually
- * written - it stays "pending wrap" at the end of the row it just
- * filled.  Plain offset/width gets this one row too high exactly at
- * multiples of width, which is what caused the display to come
- * apart whenever a line's length landed exactly on a wrapped row
- * boundary (an off-by-one, not a wrapping/scrolling design gap).
- */
-static int phys_row(int offset, int width)
+static void cmove(int dir, int n)
 {
-	if (offset > 0 && offset % width == 0)
-		return offset / width - 1;
-	return offset / width;
+	char seq[16];
+	int l;
+
+	if (n <= 0)
+		return;
+	if (dir == 'D' && n <= 4) {
+		while (n-- > 0)
+			out("\b", 1);
+		return;
+	}
+	if (dir == 'C' && n == 1) {
+		out("\033[C", 3);
+		return;
+	}
+	l = n > 1 ? snprintf(seq, sizeof(seq), "\033[%d%c", n, dir)
+		  : snprintf(seq, sizeof(seq), "\033[%c", dir);
+	out(seq, l);
+}
+
+/*
+ * The redraw, as bash does it: `shown` holds the text last drawn after
+ * the block start, and each refresh only writes from the first byte
+ * that differs from it.  Typing at the end sends just the new bytes;
+ * moving the cursor sends just the moves; an edit in the middle sends
+ * the rest of the line once, then moves back.
+ *
+ * Positions are display columns counted from the start of the block;
+ * base is the block's start column less one, so base + off is where a
+ * position falls in the rows of the terminal (a row being width columns).
+ *
+ * The cursor is at_off plus at_pend.  at_pend is the terminal's
+ * pending-wrap state: after the last character of a full row is
+ * written, the cursor stays on that row's last column and the next
+ * character wraps to the following row.  Any cursor movement clears
+ * it, so a move from there must emit something (see moveto).
+ *
+ * All moves are relative to where the cursor physically is, never to
+ * an absolute column, so the block may begin part-way along its row
+ * (after output that had no final newline).
+ */
+/* Row and column (0-based, relative to the block's first row) of the
+ * cursor at display column off; pend says it is in the pending state. */
+static void cursor_pos(int width, int base, int off, int pend,
+		       int *r, int *c)
+{
+	int a = base + off;
+
+	if (pend) {
+		*r = a / width - 1;
+		*c = width - 1;
+	} else {
+		*r = a / width;
+		*c = a % width;
+	}
+}
+
+/* Move the cursor to display column off, out of the pending state. */
+static void moveto(int width, int base, int off)
+{
+	int r0, c0, r1, c1, moved = 0;
+
+	cursor_pos(width, base, at_off, at_pend, &r0, &c0);
+	cursor_pos(width, base, off, 0, &r1, &c1);
+	if (r1 < r0) {
+		cmove('A', r0 - r1);
+		moved = 1;
+	} else if (r1 > r0) {
+		cmove('B', r1 - r0);
+		moved = 1;
+	}
+	if (c1 != c0) {
+		cmove(c1 > c0 ? 'C' : 'D', c1 > c0 ? c1 - c0 : c0 - c1);
+		moved = 1;
+	}
+	/* Leaving the pending state takes a movement; with none needed,
+	 * step left and back, which ends where it started. */
+	if (at_pend && !moved)
+		out("\b\033[C", 4);
+	at_off = off;
+	at_pend = 0;
+}
+
+/*
+ * Put the cursor at the end of the line, in the state the terminal
+ * leaves it in after writing the last character.  When the line fills
+ * its row exactly, that is the pending state, which a plain move cannot
+ * reach (the next row may not exist yet): so step onto the last
+ * character and write it again, which changes nothing on screen.
+ */
+static void park_end(int width, int base, const char *line, int len,
+		     int total)
+{
+	if (base + total > 0 && (base + total) % width == 0) {
+		int ls = len - 1;
+
+		if (at_off == total && at_pend)
+			return;
+		while (ls > 0 && ((unsigned char)line[ls] & 0xc0) == 0x80)
+			ls--;
+		moveto(width, base, total - 1);
+		out(line + ls, len - ls);
+		at_off = total;
+		at_pend = 1;
+	} else {
+		moveto(width, base, total);
+	}
 }
 
 static void refresh(int width, int start_col, int *row,
 		     const char *line, int len, int cur)
 {
-	int end, end_row;
+	int base = start_col - 1;	/* block start, on its first row */
+	int p, off_p, total, erase, r, c;
 
-	if (*row > 0)
-		outseq("\033[%dA", *row);
-	outseq("\033[%dG", start_col);
-	out("\033[J", 3);
+	/* The first byte that differs from the screen, on a character
+	 * boundary of the new line. */
+	for (p = 0; p < len && p < shown_len && line[p] == shown[p]; p++)
+		;
+	while (p > 0 && p < len && ((unsigned char)line[p] & 0xc0) == 0x80)
+		p--;
 
-	out(line, len);
+	erase = shown_len > len;
+	total = utf8_count(line, len);
+	if (p == len && erase && shown_len - len == 1 && at_off == utf8_count(line, len) + 1
+	    && !at_pend && (base + at_off) % width != 0) {
+		/* Backspace at the end of the line, cursor just after the
+		 * deleted character and not at a row's first column: backspace
+		 * onto it, blank it, and step back.  Bash sends the same. */
+		out("\b \b", 3);
+		at_off = total;
+		shown_len = len;
+		memcpy(shown, line, len);
+		goto placed;
+	}
+	if (p < len || erase) {
+		off_p = utf8_count(line, p);
+		/* Writing can start right where a pending cursor is, since
+		 * the terminal wraps before the next character; an erase
+		 * cannot, it would take the last character with it. */
+		if (!(at_pend && at_off == off_p && !erase))
+			moveto(width, base, off_p);
+		if (erase) {
+			/* Erase to the end of this row if the old text ends on
+			 * it; otherwise everything below too. */
+			int oldtot = utf8_count(shown, shown_len);
+			int oldrow = base + oldtot > 0 ? (base + oldtot - 1) / width : 0;
 
-	end = start_col - 1 + utf8_count(line, len);
-	end_row = phys_row(end, width);
-
-	if (cur == len) {
-		/* The cursor is already exactly where it belongs: right
-		 * after the last character we just wrote, pending-wrap
-		 * state and all - nothing left to do. */
-		*row = end_row;
-		return;
+			out(oldrow > (base + off_p) / width ? "\033[J" : "\033[K", 3);
+		}
+		out(line + p, len - p);
+		at_off = total;
+		/* Pending only if something was written up to the end: a bare
+		 * move (say, after a Ctrl+W that shortened the line) leaves the
+		 * cursor where moveto put it. */
+		at_pend = p < len && base + total > 0 && (base + total) % width == 0;
+		memcpy(shown, line, len);
+		shown_len = len;
 	}
 
-	/* Repositioning onto an existing character (cur < len) is
-	 * unambiguous: unlike `end` above, this offset always names a
-	 * real column that was actually written. */
-	{
-		int before = start_col - 1 + utf8_count(line, cur);
-		int want_row = before / width;
-		int want_col = before % width + 1;
+placed:
+	if (cur == len)
+		park_end(width, base, line, len, total);
+	else
+		moveto(width, base, utf8_count(line, cur));
 
-		if (end_row > want_row)
-			outseq("\033[%dA", end_row - want_row);
-		outseq("\033[%dG", want_col);
-		*row = want_row;
-	}
+	cursor_pos(width, base, at_off, at_pend, &r, &c);
+	*row = r;
 }
 
 /*
@@ -698,8 +944,6 @@ static int isdir(const char *dir, const char *name)
 static void listnames(char **v, int n, const char *dir, int width,
 		      char *line, int *len, int *cur, int *start_col, int *row)
 {
-	struct stackmark smark;
-	const char *prompt;
 	char buf[2 * 256 + 4];
 	int i, l, mx = 0, cw, nc, nr;
 
@@ -733,12 +977,10 @@ static void listnames(char **v, int n, const char *dir, int width,
 			out(buf, snprintf(buf, sizeof(buf), "%-*s", cw, v[j]));
 		out("\r\n", 2);
 	}
-	pushstackmark(&smark, stackblocksize());
-	prompt = getprompt(NULL);
-	out(prompt, strlen(prompt));
-	popstackmark(&smark);
-	*start_col = get_cursor(NULL);
-	*row = 0;
+	/* Print the prompt for this line again, exactly as it was
+	 * expanded, and put the cursor back after it. */
+	out(cur_prompt ? cur_prompt : "", cur_prompt ? cur_prompt_len : 0);
+	edit_start(width, start_col, row);
 }
 
 /* Returns non-zero if the next Tab should list the possibilities. */
@@ -860,7 +1102,7 @@ const char *miniedit_gets(int *lenp)
 	tcsetattr(0, TCSANOW, &raw);
 
 	width = get_width();
-	start_col = get_cursor(NULL);
+	edit_start(width, &start_col, &row);
 
 	for (;;) {
 		char c;
@@ -910,18 +1152,23 @@ do_enter:
 		}
 
 		if (c == 0x0c) {		/* Ctrl-L */
-			int r, n;
+			int r, n, col;
 
 			/* "Clear" the screen by scrolling it up (so it all
 			 * stays in the scrollback) until the first row of the
 			 * edit block is at the top. */
-			get_cursor(&r);
+			col = get_cursor(&r);
 			n = r - row - 1;	/* rows above the block */
 			if (r && n > 0) {
 				out("\033[999B", 6);	/* to the bottom row */
 				for (; n > 0; n -= 8)
 					out("\n\n\n\n\n\n\n\n", n < 8 ? n : 8);
 				outseq("\033[%d;1H", row + 1);
+					outseq("\033[%dG", col);
+				if (at_pend) {
+					at_off--;	/* same column, not pending */
+					at_pend = 0;
+				}
 			}
 			refresh(width, start_col, &row, line, len, cur);
 			continue;
@@ -1211,9 +1458,15 @@ esc_done:
 	}
 
 finish:
+	oflush();
 	if (hmap)
 		munmap((void *)hmap, hmaplen);
 	tcsetattr(0, TCSANOW, &save);
+
+	/* The prompt was for this line; the parser prints the next one. */
+	free(cur_prompt);
+	cur_prompt = NULL;
+	cur_prompt_len = cur_prompt_cols = 0;
 
 	if (eof) {
 		*lenp = 0;

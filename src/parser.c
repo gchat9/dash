@@ -1735,8 +1735,14 @@ static void __attribute__((noinline)) setprompt(int which)
 	show = !el;
 #endif
 	if (show && !parsefile->nleft) {
+		const char *prompt;
+
 		pushstackmark(&smark, stackblocksize());
-		out2str(getprompt(NULL));
+		prompt = getprompt(NULL);
+		out2str(prompt);
+		/* the line editor needs to know where the prompt leaves the cursor;
+		 * it is also built under SMALL (which only means no libedit) */
+		miniedit_prompt_shown(prompt);
 		popstackmark(&smark);
 	}
 }
