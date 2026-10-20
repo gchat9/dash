@@ -627,12 +627,20 @@ makename(void)
 
 void fixredir(union node *n, const char *text, int err)
 	{
+	const char *p;
+	int fd = 0;
+	int ndigits = 0;
+
 	TRACE(("Fix redir %s %d\n", text, err));
 	if (!err)
 		n->ndup.vname = NULL;
 
-	if (is_digit(text[0]) && text[1] == '\0')
-		n->ndup.dupfd = digit_val(text[0]);
+	/* Accept up to two decimal digits as a file descriptor number, not
+	 * just a single digit: '>&10' is valid and bash accepts it. */
+	for (p = text; is_digit(*p) && ndigits < 2; p++, ndigits++)
+		fd = fd * 10 + digit_val(*p);
+	if (ndigits > 0 && *p == '\0')
+		n->ndup.dupfd = fd;
 	else if (text[0] == '-' && text[1] == '\0')
 		n->ndup.dupfd = -1;
 	else {
