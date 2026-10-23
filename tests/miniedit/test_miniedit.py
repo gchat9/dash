@@ -651,6 +651,75 @@ def test_tab_list_redraws_a_wrapped_line():
     assert rows[-2:] == ["$ echo aaaaaaaaaaaaa", "aaaaaa ls alpha_"], rows
 
 
+class _cmdenv:
+    """A scratch tree for command and man page completion: a bin
+    directory with some programs, and a man tree with a few pages."""
+    FILES = {"bin/zcmd-alpha": 0o755, "bin/zcmd-beta": 0o755,
+             "bin/zcmd-noexec": 0o644,
+             "man/man1/zman.1.gz": 0o644, "man/man1/zpage.1": 0o644,
+             "man/man5/zfmt.5": 0o644}
+
+    def __init__(self):
+        import tempfile
+        self.path = os.path.realpath(tempfile.mkdtemp(prefix="cmd-"))
+        for f, mode in self.FILES.items():
+            full = os.path.join(self.path, f)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            open(full, "w").close()
+            os.chmod(full, mode)
+
+    def __enter__(self):
+        return self.path
+
+    def __exit__(self, *exc):
+        import shutil
+        shutil.rmtree(self.path, ignore_errors=True)
+
+
+def _cmd_session(lines):
+    """Point PATH and MANPATH at a _cmdenv tree, type lines in a fresh
+    session, and return (last screen row, number of bells)."""
+    with _cmdenv() as d:
+        with Session(ps1="$ ", cwd=d, home=d) as s:
+            s.send("export PATH=%s/bin:$PATH%s" % (d, ENTER))
+            s.send("export MANPATH=%s/man%s" % (d, ENTER))
+            for k in lines:
+                s.send(k)
+            rows, row, col = s.screen()
+            return rows[-1], s.text().count("\x07")
+
+
+def test_tab_command_from_path():
+    assert _cmd_session(["zcmd-a\t"]) == ("$ zcmd-alpha ", 0)
+
+
+def test_tab_command_after_semicolon():
+    assert _cmd_session(["echo hi; zcmd-a\t"]) == ("$ echo hi; zcmd-alpha ", 0)
+
+
+def test_tab_command_skips_non_executables():
+    assert _cmd_session(["zcmd-n\t"]) == ("$ zcmd-n", 1)
+
+
+def test_tab_after_redirect_is_a_file_name():
+    # not a command position: the cwd has no zcmd* names, so it rings
+    assert _cmd_session(["echo x > zcmd-a\t"]) == ("$ echo x > zcmd-a", 1)
+
+
+def test_tab_man_page_after_man():
+    assert _cmd_session(["man zp\t"]) == ("$ man zpage ", 0)
+    assert _cmd_session(["man zf\t"]) == ("$ man zfmt ", 0)
+
+
+def test_tab_man_page_strips_suffixes():
+    assert _cmd_session(["man zman\t"]) == ("$ man zman ", 0)
+
+
+def test_tab_man_section_restricts_pages():
+    assert _cmd_session(["man 5 zf\t"]) == ("$ man 5 zfmt ", 0)
+    assert _cmd_session(["man 1 zf\t"]) == ("$ man 1 zf", 1)
+
+
 # ---------------------------------------------------------------- #
 # Prompt escapes
 # ---------------------------------------------------------------- #
