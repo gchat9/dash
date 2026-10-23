@@ -321,6 +321,46 @@ def test_history_ctrl_r_own_commands_first():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_history_duplicate_moves_to_front():
+    # A repeated command is not written again, but Up brings it back
+    # first, the way bash does after a repeat.
+    import shutil
+    import tempfile
+    home = tempfile.mkdtemp(prefix="miniedit-test-")
+    try:
+        with Session(home=home) as s:
+            for c in ("echo a", "echo b", "echo c", "echo a"):
+                s.send(c + ENTER)
+            with open(os.path.join(home, ".bash_history")) as f:
+                assert f.read().splitlines() == ["echo a", "echo b", "echo c"]
+            seq = []
+            for _ in range(3):
+                s.send(UP)
+                seq.append(_visible(s))
+            assert seq == ["echo a", "echo c", "echo b"], seq
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_history_duplicate_of_other_session_is_own():
+    # Session B's line, repeated in session A, becomes A's newest.
+    import shutil
+    import tempfile
+    home = tempfile.mkdtemp(prefix="miniedit-test-")
+    try:
+        with Session(home=home) as a, Session(home=home) as b:
+            a.send("echo y" + ENTER)
+            b.send("echo x" + ENTER)
+            a.send("echo x" + ENTER)
+            a.send(UP)
+            first = _visible(a)
+            a.send(UP)
+            second = _visible(a)
+            assert (first, second) == ("echo x", "echo y"), (first, second)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 # ---------------------------------------------------------------- #
 # Ctrl-R incremental search
 # ---------------------------------------------------------------- #

@@ -549,7 +549,7 @@ placed:
  * no heap allocation, just a pointer and a length for the entry shown.
  *
  * Order, with concurrent sessions.  Each session keeps the file offsets
- * of the last HIST_SESS commands it wrote itself.  Walking back, those
+ * of the last HIST_SESS commands it wrote or repeated.  Walking back, those
  * come first, newest first; then the other lines of the file, newest
  * first, skipping the indexed ones.  Down runs the same path forwards,
  * so it is the exact reverse of Up.  Other sessions' commands therefore
@@ -620,16 +620,40 @@ static void hist_append(const char *s, int n)
 
 /*
  * Per-session index.  The file offsets of the last HIST_SESS commands
- * this shell itself appended, as a ring: hist_offs[hist_head - 1] is the
- * newest.  Up, Down and Ctrl-R walk these first, then the rest of the
- * file with these lines skipped, so commands other sessions add in the
- * meantime never interleave with this session's own.  Offsets are 32
- * bits: a history file past 4 GiB is simply not indexed.
+ * this shell wrote or re-entered, oldest first in hist_offs[0..hist_cnt).
+ * Up, Down and Ctrl-R walk these first, then the rest of the file with
+ * these lines skipped, so commands other sessions add in the meantime
+ * never interleave with this session's own.  Offsets are 32 bits: a
+ * history file past 4 GiB is simply not indexed.
  */
 #define HIST_SESS 32
 
 static uint32_t hist_offs[HIST_SESS];
-static unsigned hist_head, hist_cnt;
+static unsigned hist_cnt;
+
+/*
+ * Make off this session's newest command.  An offset already indexed
+ * moves to the newest slot instead of appearing twice; a full index
+ * drops its oldest entry.
+ */
+static void hist_index(size_t off)
+{
+	unsigned i = 0;
+
+	if (off > 0xFFFFFFFFu)
+		return;
+	while (i < hist_cnt && hist_offs[i] != off)
+		i++;
+	if (i == hist_cnt) {		/* not indexed yet */
+		if (hist_cnt < HIST_SESS)
+			hist_cnt++;
+		else
+			i = 0;		/* full: the oldest goes */
+	}
+	memmove(&hist_offs[i], &hist_offs[i + 1],
+	    (hist_cnt - i - 1) * sizeof(hist_offs[0]));
+	hist_offs[hist_cnt - 1] = (uint32_t)off;
+}
 
 /* Append s[0..n) to the history file in one locked write, and index
  * the offset it landed at.  The lock makes the lseek and the write a
@@ -658,12 +682,8 @@ static void hist_write(const char *s, int n)
 	ok = (n == 0);
 	flock(fd, LOCK_UN);
 	close(fd);
-	if (ok && off >= 0 && (unsigned long long)off <= 0xFFFFFFFFull) {
-		hist_offs[hist_head] = (uint32_t)off;
-		hist_head = (hist_head + 1) % HIST_SESS;
-		if (hist_cnt < HIST_SESS)
-			hist_cnt++;
-	}
+	if (ok && off >= 0)
+		hist_index(off);
 }
 
 /* True if the text o[0..olen) is a command whose newline may be
@@ -824,14 +844,14 @@ static int fold_text(const char *in, int n, char *out)
 
 static int hist_open(const char **map, size_t *len);
 
-/* True if the history file already has a line whose text is exactly
- * e[0..elen), with or without a final '\n'.  Only whole lines count:
- * a command is never found inside a longer one. */
-static int hist_has(const char *e, int elen)
+/* If the history file has a line whose text is exactly e[0..elen), with
+ * or without a final '\n', store the offset of the most recent such line
+ * in *off and return 1.  Only whole lines count: a command is never
+ * found inside a longer one. */
+static int hist_find(const char *e, int elen, size_t *off)
 {
-	const char *map, *p, *end;
+	const char *map, *p, *end, *last = NULL;
 	size_t maplen;
-	int found = 0;
 
 	if (elen > 0 && e[elen - 1] == '\n')
 		elen--;
@@ -840,13 +860,13 @@ static int hist_has(const char *e, int elen)
 	end = map + maplen;
 	for (p = map; (p = memmem(p, end - p, e, elen)) != NULL; p++) {
 		if ((p == map || p[-1] == '\n') &&
-		    (p + elen == end || p[elen] == '\n')) {
-			found = 1;
-			break;
-		}
+		    (p + elen == end || p[elen] == '\n'))
+			last = p;
 	}
+	if (last)
+		*off = last - map;
 	munmap((void *)map, maplen);
-	return found;
+	return last != NULL;
 }
 
 /* Should this command be left out of the history?  raw is the command
@@ -858,8 +878,14 @@ static int hist_skip(const char *raw, int rawlen, const char *entry, int elen)
 		return 1;
 #endif
 #if HIST_IGNOREDUPS
-	if (hist_has(entry, elen))
-		return 1;
+	{
+		size_t off;
+
+		if (hist_find(entry, elen, &off)) {
+			hist_index(off);
+			return 1;
+		}
+	}
 #endif
 	return 0;
 }
@@ -920,7 +946,7 @@ static int hist_open(const char **map, size_t *len)
  * The caller checks it against the mapping before using it. */
 static size_t hist_own(unsigned r)
 {
-	return hist_offs[(hist_head + HIST_SESS - 1 - r) % HIST_SESS];
+	return hist_offs[hist_cnt - 1 - r];
 }
 
 /* Rank of the indexed command starting at off, or -1 if it is not one. */

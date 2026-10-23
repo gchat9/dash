@@ -15,7 +15,8 @@ Upstream is over there:
   - prompt/command-line editor, with hardcoded escape codes. Should work on VT-100, Linux console, xterm & derivatives;
   - Tab completion of file names, of commands from $PATH at the start of a command (or after `;`), and of man page names after `man` or `man <section>`;
   - ~/.bash_history, with bash's HISTCONTROL=ignoreboth behaviour: commands starting
-    with a space, and commands already in the file, are not saved. Turn off with
+    with a space, and commands already in the file, are not saved (a repeat still
+    moves to the front for Up). Turn off with
     `--disable-hist-ignorespace` and/or `--disable-hist-ignoredups` at configure time;
   - Up, Down and Ctrl-R order history per session: this shell's own last 32 commands
     first (newest first), then the rest of the file. Down retraces Up exactly. Commands
