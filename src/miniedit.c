@@ -917,14 +917,26 @@ static int hist_step(const char *map, size_t maplen, int up,
 }
 
 /*
- * File name completion, on Tab.  Only names in a directory are completed
- * (not commands or variables), for the word before the cursor: the text
- * back to the last unescaped blank or one of ;|&()<>.  ~/ is understood;
- * other quoting is not.  Names go into the line with backslashes where
- * the shell needs them.  Like bash: a unique match is completed (plus a
- * space, or a / for a directory), several are completed as far as they
- * agree, and if that gets nowhere the next Tab lists them.
+ * Completion on Tab.  What is completed depends on the word before the
+ * cursor:
+ *
+ *  - a word with a slash in it is a path: names in that directory;
+ *  - the first word of a command (start of the line, or after ; | & ( )
+ *    is completed from the executables in $PATH;
+ *  - the word after "man", or after "man <section>", is completed from
+ *    the man page names in $MANPATH (or the usual directories), the
+ *    section restricting the search to that section's directory;
+ *  - anything else is a file name in the current directory.
+ *
+ * The word is the text back to the last unescaped blank or one of
+ * ;|&()<>.  ~/ is understood; other quoting is not.  Names go into the
+ * line with backslashes where the shell needs them.  Like bash: a unique
+ * match is completed (plus a space, or a / for a directory), several are
+ * completed as far as they agree, and if that gets nowhere the next Tab
+ * lists them.
  */
+
+enum { C_FILES, C_CMDS, C_MANS };
 
 static int namecmp(const void *a, const void *b)
 {
@@ -940,9 +952,46 @@ static int isdir(const char *dir, const char *name)
 	return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+/* Append a copy of nm to the list *vp of *np names. */
+static int addname(char ***vp, int *np, const char *nm)
+{
+	char *s, **t;
+	int n = *np;
+
+	if (!(s = malloc(strlen(nm) + 2)))	/* room for a / */
+		return 0;
+	if (!(n & 15)) {
+		if (!(t = realloc(*vp, (n + 16) * sizeof(**vp)))) {
+			free(s);
+			return 0;
+		}
+		*vp = t;
+	}
+	strcpy(s, nm);
+	(*vp)[n] = s;
+	*np = n + 1;
+	return 1;
+}
+
+/* Sorted names with duplicates removed; returns the new count. */
+static int dedup(char **v, int n)
+{
+	int i, m = 0;
+
+	for (i = 0; i < n; i++) {
+		if (m && !strcmp(v[m - 1], v[i])) {
+			free(v[i]);
+			continue;
+		}
+		v[m++] = v[i];
+	}
+	return m;
+}
+
 /* Show a list of names in columns, and redraw the prompt and line below. */
-static void listnames(char **v, int n, const char *dir, int width,
-		      char *line, int *len, int *cur, int *start_col, int *row)
+static void listnames(char **v, int n, const char *dir, int files,
+		      int width, char *line, int *len, int *cur,
+		      int *start_col, int *row)
 {
 	char buf[2 * 256 + 4];
 	int i, l, mx = 0, cw, nc, nr;
@@ -960,9 +1009,8 @@ static void listnames(char **v, int n, const char *dir, int width,
 		if (k != 'y' && k != ' ')
 			n = 0;
 	}
-	qsort(v, n, sizeof(*v), namecmp);
 	for (i = 0; i < n; i++) {
-		if (isdir(dir, v[i]))
+		if (files && isdir(dir, v[i]))
 			strcat(v[i], "/");
 		l = strlen(v[i]);
 		mx = l > mx ? l : mx;
@@ -983,18 +1031,215 @@ static void listnames(char **v, int n, const char *dir, int width,
 	edit_start(width, start_col, row);
 }
 
+/*
+ * Look at the words before the one being completed, line[0..w).  *nw is
+ * how many words the current simple command has before it, wd[0] and
+ * wd[1] are the first two of those, and *sep is the last separator
+ * (one of ;|&()<>) seen, or 0.
+ */
+static void cmdwords(const char *line, int w, int *nw, char wd[2][64],
+		     int *sep)
+{
+	int i, in = 0, k = 0;
+
+	*nw = 0;
+	*sep = 0;
+	wd[0][0] = wd[1][0] = '\0';
+	for (i = 0; i < w; i++) {
+		char c = line[i];
+		int esc = 0;
+
+		if (c == '\\' && i + 1 < w) {
+			c = line[++i];
+			esc = 1;
+		}
+		if (!esc && strchr(" \t;|&()<>", c)) {
+			in = 0;
+			if (!strchr(" \t", c)) {
+				*sep = c;
+				if (strchr(";|&(", c)) {
+					*nw = 0;
+					wd[0][0] = wd[1][0] = '\0';
+				}
+			}
+			continue;
+		}
+		if (!in) {
+			in = 1;
+			k = 0;
+			(*nw)++;
+			if (*nw <= 2)
+				wd[*nw - 1][0] = '\0';
+		}
+		if (*nw <= 2 && k < 63) {
+			wd[*nw - 1][k++] = c;
+			wd[*nw - 1][k] = '\0';
+		}
+	}
+}
+
+/* Names in one directory that start with base. */
+static void collect_dir(const char *dir, const char *base, int bl,
+			char ***vp, int *np)
+{
+	struct dirent *e;
+	DIR *d;
+
+	if (!(d = opendir(dir)))
+		return;
+	while ((e = readdir(d))) {
+		char *nm = e->d_name;
+
+		if (strncmp(nm, base, bl) || (base[0] != '.' && nm[0] == '.' &&
+		    (!nm[1] || (nm[1] == '.' && !nm[2]))))
+			continue;
+		if (!addname(vp, np, nm))
+			break;
+	}
+	closedir(d);
+}
+
+/* Executables in one $PATH directory that start with base. */
+static void scan_path_dir(const char *dir, const char *base, int bl,
+			  char ***vp, int *np)
+{
+	char path[MINIEDIT_MAXLINE + 256];
+	struct dirent *e;
+	struct stat st;
+	DIR *d;
+
+	if (!(d = opendir(dir)))
+		return;
+	while ((e = readdir(d))) {
+		char *nm = e->d_name;
+
+		if (strncmp(nm, base, bl) || (nm[0] == '.' && base[0] != '.'))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", dir, nm);
+		if (stat(path, &st) == 0 && S_ISREG(st.st_mode) &&
+		    access(path, X_OK) == 0)
+			if (!addname(vp, np, nm))
+				break;
+	}
+	closedir(d);
+}
+
+static void collect_path(const char *base, int bl, char ***vp, int *np)
+{
+	char *pv, *list, *s, *colon;
+
+	if (!(pv = lookupvar("PATH")) || !(list = malloc(strlen(pv) + 1)))
+		return;
+	strcpy(list, pv);
+	s = list;
+	for (;;) {
+		colon = strchr(s, ':');
+		if (colon)
+			*colon = '\0';
+		scan_path_dir(*s ? s : ".", base, bl, vp, np);
+		if (!colon)
+			break;
+		s = colon + 1;
+	}
+	free(list);
+}
+
+/*
+ * Turn a man page file name into the page name: drop a compression
+ * suffix, then the .section.  Returns 0 for names that are not pages.
+ */
+static int manname(char *nm)
+{
+	static const char *const comp[] = {
+		".gz", ".bz2", ".xz", ".lzma", ".zst", ".Z", NULL
+	};
+	size_t l = strlen(nm), cl;
+	char *dot;
+	int i;
+
+	for (i = 0; comp[i]; i++) {
+		cl = strlen(comp[i]);
+		if (l > cl && !strcmp(nm + l - cl, comp[i])) {
+			nm[l - cl] = '\0';
+			break;
+		}
+	}
+	if (!(dot = strrchr(nm, '.')) || dot == nm)
+		return 0;
+	*dot = '\0';
+	return 1;
+}
+
+/* Pages in one man directory (say /usr/share/man), in section sec. */
+static void scan_man_dir(const char *mdir, const char *base, int bl,
+			 const char *sec, char ***vp, int *np)
+{
+	char sub[MINIEDIT_MAXLINE + 256], nm[256];
+	struct dirent *e, *f;
+	DIR *d, *sd;
+
+	if (!(d = opendir(mdir)))
+		return;
+	while ((e = readdir(d))) {
+		char *name = e->d_name;
+
+		if (strncmp(name, "man", 3) || !name[3] ||
+		    (sec && strcmp(name + 3, sec)))
+			continue;
+		snprintf(sub, sizeof(sub), "%s/%s", mdir, name);
+		if (!(sd = opendir(sub)))
+			continue;
+		while ((f = readdir(sd))) {
+			if (strlen(f->d_name) >= sizeof(nm))
+				continue;
+			strcpy(nm, f->d_name);
+			if (!manname(nm) || strncmp(nm, base, bl))
+				continue;
+			if (!addname(vp, np, nm))
+				break;
+		}
+		closedir(sd);
+	}
+	closedir(d);
+}
+
+static void collect_man(const char *base, int bl, const char *sec,
+			char ***vp, int *np)
+{
+	static const char manpath_def[] = "/usr/share/man:/usr/local/share/man";
+	char *mp, *list, *s, *colon;
+
+	mp = lookupvar("MANPATH");
+	if (!mp || !*mp)
+		mp = (char *)manpath_def;
+	if (!(list = malloc(strlen(mp) + 1)))
+		return;
+	strcpy(list, mp);
+	s = list;
+	for (;;) {
+		colon = strchr(s, ':');
+		if (colon)
+			*colon = '\0';
+		if (*s)
+			scan_man_dir(s, base, bl, sec, vp, np);
+		if (!colon)
+			break;
+		s = colon + 1;
+	}
+	free(list);
+}
+
 /* Returns non-zero if the next Tab should list the possibilities. */
 static int tabcomplete(char *line, int *len, int *cur, int again, int width,
 		       int *start_col, int *row)
 {
-	char pre[MINIEDIT_MAXLINE], dir[MINIEDIT_MAXLINE + 64];
+	char pre[MINIEDIT_MAXLINE], dir[MINIEDIT_MAXLINE + 64] = "";
 	char ins[2 * 256 + 2], **v = NULL;
+	char wd[2][64];
 	char *base, *p, *home;
-	struct dirent *e;
-	DIR *d;
-	int i, j, n = 0, w = 0, dl, bl, cl;
+	int i, j, n = 0, w = 0, dl, bl, cl, nw, sep, kind;
 
-	for (i = 0; i < *cur; i++) {		/* find the word... */
+	for (i = 0; i < *cur; i++) {	/* find the word... */
 		if (line[i] == '\\')
 			i++;
 		else if (strchr(" \t;|&()<>", line[i]))
@@ -1012,39 +1257,40 @@ static int tabcomplete(char *line, int *len, int *cur, int again, int width,
 	dl = base - pre;
 	bl = strlen(base);
 
-	if (!dl)
-		strcpy(dir, "./");
-	else if (pre[0] == '~' && pre[1] == '/' && (home = lookupvar("HOME")))
-		snprintf(dir, sizeof(dir), "%s/%.*s", home, dl - 2, pre + 2);
-	else {
-		memcpy(dir, pre, dl);
-		dir[dl] = '\0';
-	}
+	cmdwords(line, w, &nw, wd, &sep);
+	if (dl)
+		kind = C_FILES;
+	else if (!nw && (!sep || strchr(";|&(", sep)))
+		kind = C_CMDS;
+	else if (!strcmp(wd[0], "man") &&
+		 (nw == 1 || (nw == 2 && isdigit((unsigned char)wd[1][0]))))
+		kind = C_MANS;
+	else
+		kind = C_FILES;
 
-	if ((d = opendir(dir))) {
-		while ((e = readdir(d))) {
-			char *nm = e->d_name, *s, **t;
-
-			if (strncmp(nm, base, bl) || (base[0] != '.' &&
-			    nm[0] == '.' && (!nm[1] || (nm[1] == '.' && !nm[2]))))
-				continue;
-			if (!(s = malloc(strlen(nm) + 2)))	/* room for a / */
-				break;
-			strcpy(s, nm);
-			if (!(n & 15) && !(t = realloc(v, (n + 16) * sizeof(*v)))) {
-				free(s);
-				break;
-			}
-			if (!(n & 15))
-				v = t;
-			v[n++] = s;
+	if (kind == C_FILES) {
+		if (!dl)
+			strcpy(dir, "./");
+		else if (pre[0] == '~' && pre[1] == '/' &&
+			 (home = lookupvar("HOME")))
+			snprintf(dir, sizeof(dir), "%s/%.*s", home, dl - 2,
+				 pre + 2);
+		else {
+			memcpy(dir, pre, dl);
+			dir[dl] = '\0';
 		}
-		closedir(d);
-	}
+		collect_dir(dir, base, bl, &v, &n);
+	} else if (kind == C_CMDS)
+		collect_path(base, bl, &v, &n);
+	else
+		collect_man(base, bl, nw == 2 ? wd[1] : NULL, &v, &n);
+
 	if (!n) {
 		out("\a", 1);
 		return 0;
 	}
+	qsort(v, n, sizeof(*v), namecmp);
+	n = dedup(v, n);
 
 	for (cl = strlen(v[0]), i = 1; i < n; i++) {	/* what they share */
 		for (j = 0; j < cl && v[i][j] == v[0][j]; j++)
@@ -1060,7 +1306,7 @@ static int tabcomplete(char *line, int *len, int *cur, int again, int width,
 			*p++ = v[0][i];
 		}
 		if (n == 1) {			/* unless it is already there */
-			char sc = isdir(dir, v[0]) ? '/' : ' ';
+			char sc = (kind == C_FILES && isdir(dir, v[0])) ? '/' : ' ';
 
 			if (*cur >= *len || line[*cur] != sc)
 				*p++ = sc;
@@ -1068,7 +1314,8 @@ static int tabcomplete(char *line, int *len, int *cur, int again, int width,
 		linsert(line, len, cur, ins, p - ins);
 		again = 0;
 	} else if (again) {
-		listnames(v, n, dir, width, line, len, cur, start_col, row);
+		listnames(v, n, dir, kind == C_FILES, width, line, len, cur,
+			  start_col, row);
 		again = 0;
 	} else
 		again = 1;
