@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/select.h>
@@ -542,10 +544,21 @@ placed:
 
 /*
  * History: kept entirely on disk in ~/.bash_history, one command per
- * line.  Submitting a line is a plain open+write+close, no state
- * kept around.  Up/Down instead mmap the file read-only and walk it
- * in place - no line array, no heap allocation, just a pointer and
- * a length for whichever entry is currently shown.
+ * line.  Submitting a line is one locked O_APPEND write.  Up, Down and
+ * Ctrl-R mmap the file read-only and walk it in place: no line array,
+ * no heap allocation, just a pointer and a length for the entry shown.
+ *
+ * Order, with concurrent sessions.  Each session keeps the file offsets
+ * of the last HIST_SESS commands it wrote itself.  Walking back, those
+ * come first, newest first; then the other lines of the file, newest
+ * first, skipping the indexed ones.  Down runs the same path forwards,
+ * so it is the exact reverse of Up.  Other sessions' commands therefore
+ * never appear between this session's own.  The browsing state is only
+ * the cursor pointer: a cursor on an indexed line is that line's rank.
+ *
+ * The index is not checked against the file beyond bounds: if the file
+ * is rewritten by something else, entries may come out garbled, but
+ * every access stays inside the mapping.
  */
 
 static int hist_path(char *buf, int n)
@@ -605,18 +618,35 @@ static void hist_append(const char *s, int n)
 	fold_lines++;
 }
 
-/* Append s[0..n) to the history file in a single write.  O_APPEND
- * makes the write land at the current end of file as one block. */
+/*
+ * Per-session index.  The file offsets of the last HIST_SESS commands
+ * this shell itself appended, as a ring: hist_offs[hist_head - 1] is the
+ * newest.  Up, Down and Ctrl-R walk these first, then the rest of the
+ * file with these lines skipped, so commands other sessions add in the
+ * meantime never interleave with this session's own.  Offsets are 32
+ * bits: a history file past 4 GiB is simply not indexed.
+ */
+#define HIST_SESS 32
+
+static uint32_t hist_offs[HIST_SESS];
+static unsigned hist_head, hist_cnt;
+
+/* Append s[0..n) to the history file in one locked write, and index
+ * the offset it landed at.  The lock makes the lseek and the write a
+ * unit against other dash sessions appending the same way. */
 static void hist_write(const char *s, int n)
 {
 	char path[256];
-	int fd;
+	off_t off;
+	int fd, ok = 0;
 
 	if (!hist_path(path, sizeof(path)))
 		return;
 	fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
 	if (fd < 0)
 		return;
+	flock(fd, LOCK_EX);
+	off = lseek(fd, 0, SEEK_END);
 	while (n > 0) {
 		int w = write(fd, s, n);
 
@@ -625,7 +655,15 @@ static void hist_write(const char *s, int n)
 		s += w;
 		n -= w;
 	}
+	ok = (n == 0);
+	flock(fd, LOCK_UN);
 	close(fd);
+	if (ok && off >= 0 && (unsigned long long)off <= 0xFFFFFFFFull) {
+		hist_offs[hist_head] = (uint32_t)off;
+		hist_head = (hist_head + 1) % HIST_SESS;
+		if (hist_cnt < HIST_SESS)
+			hist_cnt++;
+	}
 }
 
 /* True if the text o[0..olen) is a command whose newline may be
@@ -878,42 +916,122 @@ static int hist_open(const char **map, size_t *len)
 	return 1;
 }
 
-/* Step *cur (and *cur_len) to the history entry immediately before
- * (up = 1) or after (up = 0) the one currently shown; *cur == NULL
- * means "not currently showing any entry".  Lines are '\n'-
- * terminated.  Returns 0 if there is nowhere further to go. */
-static int hist_step(const char *map, size_t maplen, int up,
-		      const char **cur, int *cur_len)
+/* Offset of this session's indexed command of rank r (0 = newest).
+ * The caller checks it against the mapping before using it. */
+static size_t hist_own(unsigned r)
 {
-	size_t p;
+	return hist_offs[(hist_head + HIST_SESS - 1 - r) % HIST_SESS];
+}
 
-	if (up) {
-		p = *cur ? (size_t)(*cur - map) : maplen;
-		if (!p)
-			return 0;
-		p--;
-		if (p > 0 && map[p] == '\n')
-			p--;
-		while (p > 0 && map[p - 1] != '\n')
-			p--;
-		*cur = map + p;
-	} else {
-		if (!*cur)
-			return 0;
-		p = (*cur - map) + *cur_len;
-		if (p < maplen && map[p] == '\n')
-			p++;
-		if (p >= maplen)
-			return 0;
-		*cur = map + p;
-	}
-	p = *cur - map;
+/* Rank of the indexed command starting at off, or -1 if it is not one. */
+static int hist_rank(size_t off)
+{
+	unsigned r;
+
+	for (r = 0; r < hist_cnt; r++)
+		if (hist_own(r) == off)
+			return (int)r;
+	return -1;
+}
+
+/* Point *cur at the line starting at off, if off is inside the file. */
+static int hist_show(const char *map, size_t maplen, size_t off,
+		     const char **cur, int *cur_len)
+{
+	size_t p = off, n;
+
+	if (off >= maplen)
+		return 0;
 	while (p < maplen && map[p] != '\n')
 		p++;
-	*cur_len = p - (*cur - map);
-	if (*cur_len > MINIEDIT_MAXLINE - 1)
-		*cur_len = MINIEDIT_MAXLINE - 1;	/* just clamp */
+	n = p - off;
+	if (n > MINIEDIT_MAXLINE - 1)
+		n = MINIEDIT_MAXLINE - 1;	/* just clamp */
+	*cur = map + off;
+	*cur_len = n;
 	return 1;
+}
+
+/* Start of the nearest line before the one starting at x that is not
+ * indexed.  Returns 0 if there is none. */
+static int hist_prev(const char *map, size_t x, size_t *off)
+{
+	size_t p = x;
+
+	while (p > 0) {
+		p--;				/* the '\n' ending the line before */
+		while (p > 0 && map[p - 1] != '\n')
+			p--;
+		if (hist_rank(p) < 0) {
+			*off = p;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Start of the nearest line after the one starting at x that is not
+ * indexed.  Returns 0 if there is none. */
+static int hist_next(const char *map, size_t maplen, size_t x, size_t *off)
+{
+	size_t p = x;
+
+	while (p < maplen) {
+		while (p < maplen && map[p] != '\n')
+			p++;
+		if (++p >= maplen)
+			return 0;
+		if (hist_rank(p) < 0) {
+			*off = p;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Step *cur (and *cur_len) to the entry before (up = 1) or after
+ * (up = 0) the one shown; *cur == NULL means nothing is shown.  The
+ * order is this session's indexed commands newest first, then the
+ * other lines of the file newest first; Down runs that path backwards,
+ * so it is exact reverse of Up.  All state is the cursor itself.
+ * Returns 0 if there is nowhere further to go.
+ */
+static int hist_step(const char *map, size_t maplen, int up,
+		     const char **cur, int *cur_len)
+{
+	size_t x = 0, off;
+	int rank = -1;
+	unsigned i;
+
+	if (*cur) {
+		x = *cur - map;
+		rank = hist_rank(x);
+	}
+	if (up) {
+		if (!*cur || rank >= 0) {
+			for (i = *cur ? (unsigned)rank + 1 : 0; i < hist_cnt; i++)
+				if (hist_show(map, maplen, hist_own(i), cur, cur_len))
+					return 1;
+			x = maplen;	/* then the newest other line */
+		}
+		return hist_prev(map, x, &off) &&
+		       hist_show(map, maplen, off, cur, cur_len);
+	}
+	if (!*cur)
+		return 0;
+	if (rank >= 0) {			/* towards the newest own */
+		for (i = (unsigned)rank; i-- > 0; )
+			if (hist_show(map, maplen, hist_own(i), cur, cur_len))
+				return 1;
+		return 0;
+	}
+	if (hist_next(map, maplen, x, &off))
+		return hist_show(map, maplen, off, cur, cur_len);
+	for (i = hist_cnt; i-- > 0; )	/* past the newest: oldest own */
+		if (hist_show(map, maplen, hist_own(i), cur, cur_len))
+			return 1;
+	return 0;
 }
 
 /*

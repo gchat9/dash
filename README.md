@@ -17,4 +17,7 @@ Upstream is over there:
   - ~/.bash_history, with bash's HISTCONTROL=ignoreboth behaviour: commands starting
     with a space, and commands already in the file, are not saved. Turn off with
     `--disable-hist-ignorespace` and/or `--disable-hist-ignoredups` at configure time;
+  - Up, Down and Ctrl-R order history per session: this shell's own last 32 commands
+    first (newest first), then the rest of the file. Down retraces Up exactly. Commands
+    from concurrent sessions never appear between a session's own commands;
 

@@ -25,6 +25,11 @@ dash as a whole, and needs the dietlibc build to exist first.
 By default it looks for the binary at `../../src/dash`; point it
 elsewhere with `MINIEDIT_DASH=/path/to/dash`.
 
+Each `Session` has a time budget (5 seconds by default) for reading
+dash's output.  Once it is spent the harness stops draining the pty, and
+the screen goes stale.  A test that sends many commands with pauses
+must pass a larger `budget=`.
+
 ## Layout
 
 - `vtsim.py` - a small, deliberately partial VT100 simulator that

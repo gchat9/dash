@@ -218,6 +218,109 @@ def test_history_gracefully_absent():
     assert got == "ok", got
 
 
+def _visible(s):
+    rows, row, col = s.screen()
+    return rows[row].strip()
+
+
+def test_history_per_session_order_and_exact_reverse():
+    # Two concurrent sessions share one history file.  Up walks this
+    # session's own commands newest first, without the other session's
+    # lines, and Down retraces that path exactly.
+    import shutil
+    import tempfile
+    home = tempfile.mkdtemp(prefix="miniedit-test-")
+    try:
+        with Session(home=home) as a, Session(home=home) as b:
+            a.send("echo foo" + ENTER)
+            b.send("echo other1" + ENTER)
+            a.send("echo bar" + ENTER)
+            b.send("echo other2" + ENTER)
+            a.send("echo baz" + ENTER)
+            up = []
+            for _ in range(5):
+                a.send(UP)
+                up.append(_visible(a))
+            assert up == ["echo baz", "echo bar", "echo foo",
+                          "echo other2", "echo other1"], up
+            down = []
+            for _ in range(5):
+                a.send(DOWN)
+                down.append(_visible(a))
+            assert down == ["echo other2", "echo foo", "echo bar",
+                            "echo baz", ""], down
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_history_own_index_is_a_fifo_of_32():
+    # Only this session's last 32 commands are walked first; older ones
+    # are still reachable through the file.
+    import shutil
+    import tempfile
+    home = tempfile.mkdtemp(prefix="miniedit-test-")
+    try:
+        with Session(home=home, budget=60.0) as s:
+            for i in range(34):
+                s.send("echo n%02d" % i + ENTER)
+            seen = []
+            for _ in range(33):
+                s.send(UP)
+                seen.append(_visible(s))
+            assert seen[0] == "echo n33" and seen[31] == "echo n02", seen
+            assert seen[32] == "echo n01", seen   # file order continues
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_history_shrunk_file_does_not_crash():
+    # Another program rewrites the history file shorter between two
+    # edit sessions, leaving this session's indexed offsets past its
+    # end.  Stepping must stay in bounds: garbled entries are fine,
+    # a crash is not.
+    import shutil
+    import tempfile
+    home = tempfile.mkdtemp(prefix="miniedit-test-")
+    try:
+        with Session(home=home) as s:
+            s.send("echo one" + ENTER)
+            s.send("echo two" + ENTER)
+            with open(os.path.join(home, ".bash_history"), "w") as f:
+                f.write("x\n")
+            s.send(UP)
+            s.send(UP)
+            s.send(UP)
+            s.send(DOWN)
+            s.send("echo alive" + ENTER)
+            rows, row, col = s.screen()
+            assert s.alive(), "dash died after shrunken history"
+            assert "alive" in "".join(rows), rows
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_history_ctrl_r_own_commands_first():
+    import shutil
+    import tempfile
+    home = tempfile.mkdtemp(prefix="miniedit-test-")
+    try:
+        with Session(home=home) as a, Session(home=home) as b:
+            a.send("echo a1" + ENTER)
+            b.send("echo a2" + ENTER)
+            a.send("echo a3" + ENTER)
+            a.send(CTRL_R)
+            a.send("a")
+            seen = []
+            for _ in range(3):
+                seen.append(_visible(a))
+                a.send(CTRL_R)
+            assert seen == ["(reverse-i-search)`a': echo a3",
+                            "(reverse-i-search)`a': echo a1",
+                            "(reverse-i-search)`a': echo a2"], seen
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 # ---------------------------------------------------------------- #
 # Ctrl-R incremental search
 # ---------------------------------------------------------------- #

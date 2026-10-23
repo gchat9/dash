@@ -125,6 +125,14 @@ class Session:
         pattern-match on output rather than screen layout."""
         return self.data.decode("utf-8", "replace")
 
+    def alive(self):
+        """True if the dash process is still running (not exited, not a zombie)."""
+        try:
+            with open("/proc/%d/stat" % self.pid) as f:
+                return f.read().split()[2] not in ("Z", "X")
+        except OSError:
+            return False
+
     def close(self):
         with contextlib.suppress(Exception):
             os.kill(self.pid, 9)
